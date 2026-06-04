@@ -8,6 +8,7 @@ Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP
 - Per-monitor configurable intervals and timeouts
 - SQLite persistence with automatic migrations
 - Web dashboard at `http://localhost:3000`
+- Monitor detail chart with zoom/pan that loads finer detail as you zoom in — down to individual probes once the visible range is small enough
 - JSON API for programmatic access
 - Single self-contained binary
 - **Windows**: system tray icon, double-click to open dashboard, no console window
@@ -50,7 +51,7 @@ Create a `config.toml` (see `config.toml` in this repo for a full example):
 [defaults]
 timeout_ms = 10000
 interval_ms = 60000
-# retention_days = 90   # Uncomment to prune results older than N days
+# retention_days defaults to 90 when unset; set explicitly to keep more/less history
 
 [web]
 bind = "0.0.0.0:3000"
@@ -88,7 +89,7 @@ interval_ms = 30000
 |---|---|---|---|
 | `[defaults].timeout_ms` | integer | 10000 | Default probe timeout (ms) |
 | `[defaults].interval_ms` | integer | 60000 | Default probe interval (ms) |
-| `[defaults].retention_days` | integer | — | Delete results older than N days |
+| `[defaults].retention_days` | integer | 90 | Delete results older than N days. Defaults to 90 when unset (probe history is pruned automatically so the database doesn't grow without bound — important at low poll intervals). Set a larger value to keep more history. |
 | `[web].bind` | string | `0.0.0.0:3000` | Web server bind address |
 | `[database].path` | string | `./data/rusty-pingus.db` | SQLite file path |
 
@@ -162,8 +163,9 @@ TCP and HTTP probes work without elevated privileges.
 ## API
 
 - `GET /api/monitors` — current status of all monitors
-- `GET /api/monitors/:name/history?from=<iso8601>&to=<iso8601>&limit=100` — probe history
+- `GET /api/monitors/:name/history?from=<iso8601>&to=<iso8601>&limit=100` — raw probe history
 - `GET /api/monitors/:name/uptime` — uptime % for 1h, 24h, 7d, 30d windows
+- `GET /api/monitors/:name/series?from=<iso8601>&to=<iso8601>&buckets=300` — response time aggregated into a bounded number of time buckets (each: bucket start, avg/min/max ms, sample count, up-ratio). Used by the monitor detail chart so any window stays fast regardless of poll interval. `buckets` is clamped to 50–1000; defaults are the last 24h with ~300 buckets.
 
 ## systemd
 

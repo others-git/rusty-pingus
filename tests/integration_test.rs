@@ -136,6 +136,55 @@ async fn history_query_returns_ordered_results() {
     }
 }
 
+#[tokio::test]
+async fn series_buckets_are_bounded_and_aggregated() {
+    let (pool, _dir) = open_temp_db().await;
+    let now = chrono::Utc::now();
+
+    // 20 results over the last hour (every ~3 min); every 4th is down.
+    for i in 0..20i64 {
+        let up = i % 4 != 0;
+        let r = probe::ProbeResult {
+            monitor_name: "series-test".into(),
+            protocol: "http".into(),
+            endpoint: "https://example.com".into(),
+            status: if up { "up" } else { "down" }.into(),
+            response_time_ms: if up { Some((10 + i) as u64) } else { None },
+            failure_reason: if up { None } else { Some("timeout".into()) },
+            checked_at: now - chrono::Duration::minutes((19 - i) * 3),
+        };
+        db::insert_result(&pool, &r).await.expect("insert");
+    }
+
+    let from = now - chrono::Duration::hours(1) - chrono::Duration::minutes(5);
+    let buckets = db::get_series(&pool, "series-test", from, now, 5)
+        .await
+        .expect("get_series");
+
+    assert!(!buckets.is_empty(), "expected some buckets");
+    assert!(buckets.len() <= 5, "expected at most 5 buckets, got {}", buckets.len());
+
+    let total: i64 = buckets.iter().map(|b| b.count).sum();
+    assert_eq!(total, 20, "all 20 results should be counted across buckets");
+
+    for b in &buckets {
+        assert!(b.count > 0, "each returned bucket has rows");
+        assert!(b.up_ratio >= 0.0 && b.up_ratio <= 1.0, "up_ratio in [0,1], got {}", b.up_ratio);
+    }
+
+    // A range with no results returns an empty series.
+    let empty = db::get_series(
+        &pool,
+        "series-test",
+        now - chrono::Duration::days(40),
+        now - chrono::Duration::days(39),
+        5,
+    )
+    .await
+    .expect("get_series empty");
+    assert!(empty.is_empty(), "no results in range → empty series");
+}
+
 #[test]
 fn missing_config_generates_default_and_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");

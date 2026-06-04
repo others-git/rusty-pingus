@@ -32,27 +32,41 @@ pub struct MonitorStatus {
 }
 
 pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
-    let statuses = match db::get_current_status(&state.pool).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "DB error in list_monitors");
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response();
+    // The dashboard reflects the *configured* monitors (monitors.toml), each joined
+    // with its latest probe result via an O(1) index seek. This excludes stale probe
+    // history for unconfigured monitors and scales with the monitor count, not the
+    // total row count. Configured-but-unprobed monitors show as pending.
+    let configured = state.monitors.list().await;
+    let mut result = Vec::with_capacity(configured.len());
+    for m in &configured {
+        let name = m.name().to_string();
+        match db::get_latest_status(&state.pool, &name).await {
+            Ok(Some(s)) => {
+                let uptime_24h = db::get_uptime(&state.pool, &name, 86_400).await.ok().flatten();
+                result.push(MonitorStatus {
+                    name,
+                    protocol: s.protocol,
+                    endpoint: s.endpoint,
+                    status: s.status,
+                    last_checked_at: Some(s.checked_at),
+                    response_time_ms: s.response_time_ms,
+                    failure_reason: s.failure_reason,
+                    uptime_24h,
+                });
+            }
+            _ => {
+                result.push(MonitorStatus {
+                    name,
+                    protocol: m.protocol().to_string(),
+                    endpoint: m.endpoint(),
+                    status: "pending".to_string(),
+                    last_checked_at: None,
+                    response_time_ms: None,
+                    failure_reason: None,
+                    uptime_24h: None,
+                });
+            }
         }
-    };
-
-    let mut result = Vec::with_capacity(statuses.len());
-    for s in statuses {
-        let uptime_24h = db::get_uptime(&state.pool, &s.monitor_name, 86_400).await.ok().flatten();
-        result.push(MonitorStatus {
-            name: s.monitor_name,
-            protocol: s.protocol,
-            endpoint: s.endpoint,
-            status: s.status,
-            last_checked_at: Some(s.checked_at),
-            response_time_ms: s.response_time_ms,
-            failure_reason: s.failure_reason,
-            uptime_24h,
-        });
     }
     Json(result).into_response()
 }
@@ -117,6 +131,31 @@ pub async fn monitor_uptime(
         uptime_7d: u7d.ok().flatten(),
         uptime_30d: u30d.ok().flatten(),
     }).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SeriesParams {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub buckets: Option<i64>,
+}
+
+pub async fn monitor_series(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<SeriesParams>,
+) -> impl IntoResponse {
+    let to = params.to.unwrap_or_else(Utc::now);
+    let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
+    let buckets = params.buckets.unwrap_or(300).clamp(50, 1000);
+
+    match db::get_series(&state.pool, &name, from, to, buckets).await {
+        Ok(series) => Json(series).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "DB error in monitor_series");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
+        }
+    }
 }
 
 // ── Monitor CRUD endpoints ────────────────────────────────────────────────────
@@ -194,7 +233,6 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
             } else if !c.url.starts_with("http://") && !c.url.starts_with("https://") {
                 errors.push("url must be a valid http or https URL".into());
             }
-            validate_timing(c.interval_ms, c.timeout_ms, &mut errors);
         }
         MonitorConfig::Tcp(c) => {
             if c.host.is_empty() {
@@ -203,26 +241,13 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
             if c.port == 0 {
                 errors.push("port must be between 1 and 65535".into());
             }
-            validate_timing(c.interval_ms, c.timeout_ms, &mut errors);
         }
         MonitorConfig::Icmp(c) => {
             if c.host.is_empty() {
                 errors.push("host is required".into());
             }
-            validate_timing(c.interval_ms, c.timeout_ms, &mut errors);
         }
     }
 
     errors
-}
-
-fn validate_timing(interval_ms: u64, timeout_ms: u64, errors: &mut Vec<String>) {
-    if interval_ms < 5_000 {
-        errors.push("interval_ms must be at least 5000".into());
-    }
-    if timeout_ms < 1_000 {
-        errors.push("timeout_ms must be at least 1000".into());
-    } else if timeout_ms >= interval_ms {
-        errors.push("timeout_ms must be less than interval_ms".into());
-    }
 }
