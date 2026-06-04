@@ -51,11 +51,20 @@ async fn tcp_probe_up_stored_in_db() {
 async fn tcp_probe_down_stored_in_db() {
     let (pool, _dir) = open_temp_db().await;
 
-    // Port 1 is almost certainly refused on loopback.
+    // Bind a random port to get a free one, then immediately drop the listener.
+    // The OS will refuse connections to that port immediately on both Linux and
+    // Windows — unlike port 1 which may hit a firewall timeout on Windows.
+    let refused_port = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+
     let cfg = TcpMonitorConfig {
         name: "test-tcp-down".into(),
         host: "127.0.0.1".into(),
-        port: 1,
+        port: refused_port,
         interval_secs: 60,
         timeout_secs: 2,
     };

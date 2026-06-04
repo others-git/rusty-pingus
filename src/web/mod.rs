@@ -66,7 +66,7 @@ pub async fn serve(bind: String, pool: SqlitePool, cancel: CancellationToken) {
         .route("/api/monitors", get(api::list_monitors))
         .route("/api/monitors/{name}/history", get(api::monitor_history))
         .route("/api/monitors/{name}/uptime", get(api::monitor_uptime))
-        .route("/{*path}", get(serve_asset))
+        .route("/*path", get(serve_asset))
         .with_state(pool);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
