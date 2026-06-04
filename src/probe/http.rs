@@ -32,9 +32,12 @@ pub async fn run(cfg: &HttpMonitorConfig) -> ProbeResult {
             let status = resp.status().as_u16();
             let expected = cfg.expected_status.unwrap_or(0);
             debug!(monitor = %cfg.name, status, elapsed_ms = elapsed, "HTTP probe");
-            if expected != 0 && status != expected {
-                ProbeResult::down(&cfg.name, "http", &cfg.url, &format!("unexpected_status:{status}"))
-            } else if !cfg.expected_status.is_some() && !resp.status().is_success() {
+            let failed = if cfg.expected_status.is_some() {
+                status != expected
+            } else {
+                !resp.status().is_success()
+            };
+            if failed {
                 ProbeResult::down(&cfg.name, "http", &cfg.url, &format!("unexpected_status:{status}"))
             } else {
                 ProbeResult::up(&cfg.name, "http", &cfg.url, elapsed)

@@ -1,9 +1,4 @@
-mod config;
-mod db;
-mod probe;
-mod scheduler;
-mod api;
-mod web;
+use rusty_pingus::{config, db, probe, scheduler, web};
 
 use anyhow::Result;
 use clap::Parser;
