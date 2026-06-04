@@ -218,7 +218,6 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
             } else if !c.url.starts_with("http://") && !c.url.starts_with("https://") {
                 errors.push("url must be a valid http or https URL".into());
             }
-            validate_timing(c.interval_ms, c.timeout_ms, &mut errors);
         }
         MonitorConfig::Tcp(c) => {
             if c.host.is_empty() {
@@ -227,26 +226,13 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
             if c.port == 0 {
                 errors.push("port must be between 1 and 65535".into());
             }
-            validate_timing(c.interval_ms, c.timeout_ms, &mut errors);
         }
         MonitorConfig::Icmp(c) => {
             if c.host.is_empty() {
                 errors.push("host is required".into());
             }
-            validate_timing(c.interval_ms, c.timeout_ms, &mut errors);
         }
     }
 
     errors
-}
-
-fn validate_timing(interval_ms: u64, timeout_ms: u64, errors: &mut Vec<String>) {
-    if interval_ms < 5_000 {
-        errors.push("interval_ms must be at least 5000".into());
-    }
-    if timeout_ms < 1_000 {
-        errors.push("timeout_ms must be at least 1000".into());
-    } else if timeout_ms >= interval_ms {
-        errors.push("timeout_ms must be less than interval_ms".into());
-    }
 }
