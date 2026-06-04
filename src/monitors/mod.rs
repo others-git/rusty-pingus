@@ -64,6 +64,23 @@ impl MonitorConfig {
             Self::Icmp(c) => c.interval_ms,
         }
     }
+
+    pub fn protocol(&self) -> &'static str {
+        match self {
+            Self::Http(_) => "http",
+            Self::Tcp(_) => "tcp",
+            Self::Icmp(_) => "icmp",
+        }
+    }
+
+    /// The display endpoint, matching what the probe records in `probe_results`.
+    pub fn endpoint(&self) -> String {
+        match self {
+            Self::Http(c) => c.url.clone(),
+            Self::Tcp(c) => format!("{}:{}", c.host, c.port),
+            Self::Icmp(c) => c.host.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

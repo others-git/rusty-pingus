@@ -7,6 +7,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 
 use crate::db;
 use crate::monitors::{MonitorConfig, MonitorStore};
@@ -40,19 +41,42 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
 
-    let mut result = Vec::with_capacity(statuses.len());
-    for s in statuses {
-        let uptime_24h = db::get_uptime(&state.pool, &s.monitor_name, 86_400).await.ok().flatten();
-        result.push(MonitorStatus {
-            name: s.monitor_name,
-            protocol: s.protocol,
-            endpoint: s.endpoint,
-            status: s.status,
-            last_checked_at: Some(s.checked_at),
-            response_time_ms: s.response_time_ms,
-            failure_reason: s.failure_reason,
-            uptime_24h,
-        });
+    // Index the latest probe result by monitor name so we can join it against the
+    // configured monitors.
+    let mut status_by_name: HashMap<String, db::CurrentStatus> =
+        statuses.into_iter().map(|s| (s.monitor_name.clone(), s)).collect();
+
+    // The dashboard reflects the *configured* monitors (monitors.toml), joined with
+    // their latest probe result. This excludes stale probe history for monitors that
+    // are no longer configured, and shows configured-but-unprobed monitors as pending.
+    let configured = state.monitors.list().await;
+    let mut result = Vec::with_capacity(configured.len());
+    for m in &configured {
+        let name = m.name().to_string();
+        if let Some(s) = status_by_name.remove(&name) {
+            let uptime_24h = db::get_uptime(&state.pool, &name, 86_400).await.ok().flatten();
+            result.push(MonitorStatus {
+                name,
+                protocol: s.protocol,
+                endpoint: s.endpoint,
+                status: s.status,
+                last_checked_at: Some(s.checked_at),
+                response_time_ms: s.response_time_ms,
+                failure_reason: s.failure_reason,
+                uptime_24h,
+            });
+        } else {
+            result.push(MonitorStatus {
+                name,
+                protocol: m.protocol().to_string(),
+                endpoint: m.endpoint(),
+                status: "pending".to_string(),
+                last_checked_at: None,
+                response_time_ms: None,
+                failure_reason: None,
+                uptime_24h: None,
+            });
+        }
     }
     Json(result).into_response()
 }
