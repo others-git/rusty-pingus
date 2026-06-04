@@ -1,19 +1,30 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::{sqlite::SqlitePoolOptions, FromRow, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{FromRow, Row, SqlitePool};
+use std::str::FromStr;
 
 use crate::probe::ProbeResult;
 
 pub async fn init(path: &str) -> Result<SqlitePool> {
-    let url = format!("sqlite://{}?mode=rwc", path);
+    // Pragmas are applied per connection (via connect options) so every pooled
+    // connection gets them — setting them once on the pool only affects one
+    // connection. temp_store=MEMORY keeps GROUP BY/sort temp b-trees off disk
+    // (important on slow filesystems), and a larger cache/mmap speeds the large
+    // index scans used by the series/uptime aggregations.
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path))?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .pragma("temp_store", "MEMORY")
+        .pragma("cache_size", "-65536") // 64 MB page cache (negative = KiB)
+        .pragma("mmap_size", "268435456"); // 256 MB memory-map
+
     let pool = SqlitePoolOptions::new()
         .max_connections(8)
-        .connect(&url)
+        .connect_with(opts)
         .await?;
-
-    sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
-    sqlx::query("PRAGMA synchronous=NORMAL").execute(&pool).await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -46,6 +57,22 @@ pub struct CurrentStatus {
     pub response_time_ms: Option<i64>,
     pub failure_reason: Option<String>,
     pub checked_at: String,
+}
+
+/// Latest probe result for a single monitor. O(1) index seek — used by the
+/// dashboard so its cost scales with the number of monitors, not total rows.
+pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<Option<CurrentStatus>> {
+    let row = sqlx::query_as::<_, CurrentStatus>(
+        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, checked_at
+         FROM probe_results
+         WHERE monitor_name = ?
+         ORDER BY checked_at DESC
+         LIMIT 1",
+    )
+    .bind(monitor_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 pub async fn get_current_status(pool: &SqlitePool) -> Result<Vec<CurrentStatus>> {
@@ -126,6 +153,75 @@ pub async fn get_uptime(
     }
     let up: i64 = row.try_get("up_count").unwrap_or(0);
     Ok(Some((up as f64 / total as f64) * 100.0))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SeriesBucket {
+    pub ts: String,
+    pub avg_ms: Option<f64>,
+    pub min_ms: Option<i64>,
+    pub max_ms: Option<i64>,
+    pub count: i64,
+    pub up_ratio: f64,
+}
+
+/// Aggregate a monitor's results over `[from, to]` into at most `buckets` time
+/// buckets, each reporting avg/min/max response time, sample count, and up-ratio.
+/// Bounds the output regardless of how many raw rows fall in the range.
+pub async fn get_series(
+    pool: &SqlitePool,
+    monitor_name: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    buckets: i64,
+) -> Result<Vec<SeriesBucket>> {
+    // Map each row into one of `n` slots spanning [from, to] so the output is
+    // strictly bounded to `n` buckets regardless of volume or epoch alignment.
+    let n = buckets.clamp(1, 5000);
+    let from_epoch = from.timestamp();
+    let span_secs = (to.timestamp() - from_epoch).max(1);
+    let from_str = from.to_rfc3339();
+    let to_str = to.to_rfc3339();
+
+    let rows = sqlx::query(
+        "SELECT MIN(? - 1, (CAST(strftime('%s', checked_at) AS INTEGER) - ?) * ? / ?) AS bucket,
+                AVG(response_time_ms) AS avg_ms,
+                MIN(response_time_ms) AS min_ms,
+                MAX(response_time_ms) AS max_ms,
+                COUNT(*) AS cnt,
+                AVG(CASE WHEN status = 'up' THEN 1.0 ELSE 0.0 END) AS up_ratio
+         FROM probe_results
+         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
+         GROUP BY bucket
+         ORDER BY bucket",
+    )
+    .bind(n)
+    .bind(from_epoch)
+    .bind(n)
+    .bind(span_secs)
+    .bind(monitor_name)
+    .bind(&from_str)
+    .bind(&to_str)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bucket: i64 = row.try_get("bucket")?;
+        let ts_epoch = from_epoch + (bucket * span_secs) / n;
+        let ts = DateTime::<Utc>::from_timestamp(ts_epoch, 0)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_default();
+        out.push(SeriesBucket {
+            ts,
+            avg_ms: row.try_get("avg_ms").ok().flatten(),
+            min_ms: row.try_get("min_ms").ok().flatten(),
+            max_ms: row.try_get("max_ms").ok().flatten(),
+            count: row.try_get("cnt").unwrap_or(0),
+            up_ratio: row.try_get("up_ratio").unwrap_or(0.0),
+        });
+    }
+    Ok(out)
 }
 
 pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result<u64> {

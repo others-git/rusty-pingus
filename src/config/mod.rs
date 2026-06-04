@@ -2,6 +2,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Default retention applied when `[defaults].retention_days` is unset, so the
+/// probe_results table is pruned by age out of the box rather than growing forever.
+pub const DEFAULT_RETENTION_DAYS: u64 = 90;
+
 pub const DEFAULT_CONFIG: &str = r#"# rusty-pingus configuration
 # Generated automatically — edit to update app settings and restart.
 # Monitors are managed separately in monitors.toml (or via the web UI).
@@ -9,6 +13,7 @@ pub const DEFAULT_CONFIG: &str = r#"# rusty-pingus configuration
 [defaults]
 timeout_ms = 10000
 interval_ms = 60000
+# retention_days defaults to 90 when unset; uncomment to override (e.g. keep longer).
 # retention_days = 90
 
 [web]

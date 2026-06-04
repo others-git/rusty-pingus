@@ -126,6 +126,7 @@ async fn run_probe(monitor: &MonitorConfig, pool: &SqlitePool) -> anyhow::Result
 }
 
 pub async fn retention_loop(pool: SqlitePool, retention_days: u64, cancel: CancellationToken) {
+    info!(retention_days, "Retention loop started; pruning probe results older than this daily");
     let mut ticker = tokio::time::interval(Duration::from_secs(86_400));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {

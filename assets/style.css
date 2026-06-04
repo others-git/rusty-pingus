@@ -1,10 +1,11 @@
 /* Hide x-cloak elements until Alpine.js initializes (prevents modal flash on load) */
 [x-cloak] { display: none !important; }
 
-/* Chart.js canvas — needs explicit height since Tailwind doesn't set it */
+/* Chart.js canvas — needs explicit height since Tailwind doesn't set it.
+   The monitor detail chart is the primary element, so give it more room. */
 .chart-canvas-wrap {
   position: relative;
-  height: 220px;
+  height: 340px;
 }
 
 /* Ensure no text-decoration bleeds into card links */

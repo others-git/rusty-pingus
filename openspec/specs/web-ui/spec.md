@@ -74,19 +74,31 @@ The system SHALL provide a modal form for adding new monitors, accessible from t
 - **THEN** the modal closes without saving
 
 ### Requirement: Monitor detail page
-The system SHALL serve a detail page at `/monitors/:name` showing the full probe history, a dark-themed gradient response time Chart.js chart, and uptime percentages for multiple windows (1h, 24h, 7d, 30d) rendered as SVG gauge rings. Alpine.js SHALL manage data fetching and state for this page.
+The system SHALL serve a data-first detail page at `/monitors/:name`. The page SHALL lead with the monitor's live status and a compact metrics strip (latest response time, 24h uptime, last check time as relative time, and sample/total-check count). The primary element SHALL be a response-time chart rendered on a time-scale x-axis that supports zooming (mouse wheel and drag) and panning, with a control to reset the zoom to the active window. The chart data SHALL come from the aggregated series endpoint (not raw rows). Uptime percentages for 1h, 24h, 7d, and 30d SHALL be shown as compact, clickable selectors; clicking one SHALL set the chart's active time range to that window. A raw probe history table SHALL remain available as a secondary, capped element. Alpine.js SHALL manage data fetching and state for this page.
 
-#### Scenario: Response time chart displayed
+#### Scenario: Metrics strip shown first
 - **WHEN** a user opens a monitor detail page
-- **THEN** a Chart.js line chart with a dark background (`slate-900`), a cyan/teal gradient fill, and no visible gridlines renders the last 24 hours of response times
+- **THEN** the live status and a compact metrics strip (latest response time, 24h uptime, last check as relative time, sample count) appear above the chart
 
-#### Scenario: Uptime windows shown as gauge rings
+#### Scenario: Response time chart on a zoomable time scale
+- **WHEN** a user opens a monitor detail page
+- **THEN** a dark-themed Chart.js line chart renders response time over a true time-scale x-axis, and the user can zoom with the mouse wheel or by dragging and can pan the visible range
+
+#### Scenario: Reset zoom
+- **WHEN** a user has zoomed or panned the chart and activates the reset control
+- **THEN** the chart returns to the currently active window
+
+#### Scenario: Clickable uptime window sets the chart range
+- **WHEN** a user clicks the 7d uptime window
+- **THEN** the chart's active range is set to the last 7 days, the corresponding aggregated data is loaded, and the 7d window is visually highlighted as selected
+
+#### Scenario: Uptime windows shown as selectors
 - **WHEN** a user views a monitor detail page
-- **THEN** four SVG circular gauge rings display uptime percentages for 1h, 24h, 7d, and 30d windows, each colored by threshold (emerald/amber/red)
+- **THEN** uptime percentages for 1h, 24h, 7d, and 30d are displayed as compact controls colored by threshold (emerald/amber/red), the active window indicated
 
-#### Scenario: History table with styled rows
-- **WHEN** a user views the probe history table on the detail page
-- **THEN** each row shows a colored status badge, timestamp, response time, and failure reason (if any), with alternating `slate-800`/`slate-900` row backgrounds
+#### Scenario: History table is secondary
+- **WHEN** a user scrolls past the chart
+- **THEN** a capped raw probe history table shows recent rows with a colored status badge, timestamp, response time, and failure reason
 
 ### Requirement: JSON API for monitor status
 The system SHALL expose a `GET /api/monitors` endpoint returning the current status of all monitors as a JSON array.
@@ -109,6 +121,52 @@ The system SHALL expose a `GET /api/monitors/:name/history` endpoint returning p
 #### Scenario: Unknown monitor name
 - **WHEN** `GET /api/monitors/nonexistent/history` is requested
 - **THEN** the API returns HTTP 404 with a JSON error body
+
+### Requirement: JSON API for aggregated response-time series
+The system SHALL expose `GET /api/monitors/:name/series` returning response-time and availability data bucketed over a `[from, to]` time range into a bounded number of points, suitable for charting any window without returning raw rows. Query parameters `from`, `to`, and `buckets` SHALL be optional with sensible defaults.
+
+#### Scenario: Series returns bucketed points
+- **WHEN** `GET /api/monitors/my-api/series?from=<iso8601>&to=<iso8601>&buckets=300` is requested
+- **THEN** a JSON array of at most ~300 buckets is returned, each with a bucket start timestamp, average/min/max response time, sample count, and up-ratio
+
+#### Scenario: Default range and bounded buckets
+- **WHEN** `GET /api/monitors/my-api/series` is requested without parameters
+- **THEN** the last 24 hours are returned as a bounded number of buckets with HTTP 200
+
+#### Scenario: Bucket count is clamped
+- **WHEN** a series request specifies an excessively large `buckets` value
+- **THEN** the server clamps it to a safe maximum before querying
+
+#### Scenario: Monitor with no results in range
+- **WHEN** `GET /api/monitors/my-api/series` is requested for a range containing no probe results
+- **THEN** an empty JSON array is returned with HTTP 200
+
+### Requirement: Dynamic chart resolution
+The monitor detail response-time chart SHALL load data at a resolution matched to the visible time range. When the user zooms or pans, the chart SHALL refetch data for the currently visible range so that range is rendered at approximately the chart's point budget rather than the originally loaded window's resolution. When the visible range contains few enough probes to render individually, the chart SHALL display raw probe points; otherwise it SHALL display aggregated buckets. Refetches SHALL be debounced, and a loading indicator SHALL be shown while finer data loads. Resetting the zoom SHALL restore the active window and its resolution.
+
+#### Scenario: Zooming in loads finer data
+- **WHEN** a user zooms into a sub-range of the chart
+- **THEN** after the gesture settles, data for the visible range is refetched and the chart renders that range at higher temporal resolution than before the zoom
+
+#### Scenario: Raw probes appear at deep zoom
+- **WHEN** the user zooms in until the visible range contains at most the raw-point budget of probes
+- **THEN** the chart renders each individual probe as a point (raw mode) rather than aggregated buckets
+
+#### Scenario: Aggregated buckets when zoomed out
+- **WHEN** the visible range contains more probes than can be rendered individually
+- **THEN** the chart renders aggregated buckets (avg/min/max, up-ratio) for the visible range
+
+#### Scenario: Panning loads the newly visible range
+- **WHEN** a user pans the chart to a different time range
+- **THEN** after the gesture settles, data for the newly visible range is fetched and rendered
+
+#### Scenario: Refetches are debounced
+- **WHEN** a user performs rapid successive zoom or pan gestures
+- **THEN** intermediate refetches are coalesced so the server is not queried on every interaction, and only the final visible range is loaded
+
+#### Scenario: Reset restores the active window
+- **WHEN** a user activates the reset control after zooming or panning
+- **THEN** the chart returns to the active uptime window and reloads that window's resolution
 
 ### Requirement: Dashboard auto-refresh
 The system SHALL poll the `/api/monitors` endpoint every 30 seconds using Alpine.js reactive state and update the dashboard display without a full page reload. A visual "last updated" timestamp SHALL be shown and updated on each successful poll.

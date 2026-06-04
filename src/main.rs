@@ -146,14 +146,13 @@ async fn async_main(
         tokio::spawn(web::serve(bind, state, cancel))
     };
 
-    let retention_handle = if let Some(days) = cfg.defaults.retention_days {
+    let retention_handle = {
+        let days = cfg.defaults.retention_days.unwrap_or(config::DEFAULT_RETENTION_DAYS);
         let pool = pool.clone();
         let cancel = cancel.clone();
         Some(tokio::spawn(async move {
             scheduler::retention_loop(pool, days, cancel).await;
         }))
-    } else {
-        None
     };
 
     #[cfg(not(windows))]
