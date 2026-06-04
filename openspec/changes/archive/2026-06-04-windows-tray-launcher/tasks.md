@@ -39,8 +39,8 @@
 
 ## 6. Verification
 
-- [ ] 6.1 Build for Windows target (`cargo build --target x86_64-pc-windows-msvc`) and confirm it compiles cleanly
-- [ ] 6.2 Verify `cargo clippy -- -D warnings` passes on the Windows target
+- [x] 6.1 Build for Windows target (`cargo build --target x86_64-pc-windows-msvc`) and confirm it compiles cleanly
+- [x] 6.2 Verify `cargo clippy -- -D warnings` passes on the Windows target
 - [x] 6.3 Smoke test on a real Windows machine: double-click produces tray icon, no console window, left-click opens browser, Quit shuts down cleanly
 - [x] 6.4 Smoke test missing config: covered by `missing_config_generates_default_and_returns_empty` integration test
 - [x] 6.5 Update `README.md`: added Windows section documenting tray icon usage, first-launch behaviour, and log file location
