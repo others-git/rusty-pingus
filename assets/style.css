@@ -1,3 +1,6 @@
+/* Hide x-cloak elements until Alpine.js initializes (prevents modal flash on load) */
+[x-cloak] { display: none !important; }
+
 /* Chart.js canvas — needs explicit height since Tailwind doesn't set it */
 .chart-canvas-wrap {
   position: relative;
