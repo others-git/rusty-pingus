@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use surge_ping::{Client, Config, PingIdentifier, PingSequence, ICMP};
 use tracing::{debug, warn};
 
-use crate::config::IcmpMonitorConfig;
+use crate::monitors::IcmpMonitorConfig;
 use super::ProbeResult;
 
 pub fn check_privilege() -> bool {
@@ -41,7 +41,7 @@ pub async fn run(cfg: &IcmpMonitorConfig) -> ProbeResult {
 
     let mut pinger = client.pinger(ip, PingIdentifier(rand_id())).await;
 
-    pinger.timeout(Duration::from_secs(cfg.timeout_secs));
+    pinger.timeout(Duration::from_millis(cfg.timeout_ms));
 
     let start = Instant::now();
     match pinger.ping(PingSequence(0), &[]).await {

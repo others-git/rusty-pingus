@@ -3,6 +3,21 @@ function dashboard() {
     monitors: [],
     loading: true,
     lastUpdated: null,
+    pendingDelete: null,
+    showAddModal: false,
+    submitting: false,
+    form: {
+      protocol: 'http',
+      name: '',
+      url: '',
+      host: '',
+      port: 443,
+      method: 'GET',
+      expected_status: null,
+      interval_ms: 60000,
+      timeout_ms: 10000,
+    },
+    formErrors: {},
 
     get upCount() {
       return this.monitors.filter(m => m.status === 'up').length;
@@ -26,6 +41,90 @@ function dashboard() {
       } finally {
         this.loading = false;
       }
+    },
+
+    async deleteMonitor(name) {
+      this.pendingDelete = null;
+      try {
+        const res = await fetch(`/api/monitors/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        if (res.ok) {
+          this.monitors = this.monitors.filter(m => m.name !== name);
+        }
+      } catch (e) {
+        console.error('Delete failed', e);
+      }
+    },
+
+    async submitMonitor() {
+      this.formErrors = {};
+      this.submitting = true;
+
+      const body = {
+        protocol: this.form.protocol,
+        name: this.form.name,
+        interval_ms: this.form.interval_ms,
+        timeout_ms: this.form.timeout_ms,
+      };
+
+      if (this.form.protocol === 'http') {
+        body.url = this.form.url;
+        body.method = this.form.method;
+        if (this.form.expected_status) body.expected_status = this.form.expected_status;
+      } else {
+        body.host = this.form.host;
+        if (this.form.protocol === 'tcp') body.port = this.form.port;
+      }
+
+      try {
+        const res = await fetch('/api/monitors', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        if (res.status === 201) {
+          // Success — refresh monitors and close modal
+          await this.fetchMonitors();
+          this.showAddModal = false;
+          this.resetForm();
+        } else if (res.status === 422) {
+          const data = await res.json();
+          this.mapErrors(data.errors || []);
+        } else {
+          this.formErrors._general = 'Unexpected error. Please try again.';
+        }
+      } catch (e) {
+        this.formErrors._general = 'Network error. Is the server running?';
+      } finally {
+        this.submitting = false;
+      }
+    },
+
+    mapErrors(errors) {
+      for (const msg of errors) {
+        if (msg.includes('name')) this.formErrors.name = msg;
+        else if (msg.includes('url')) this.formErrors.url = msg;
+        else if (msg.includes('host')) this.formErrors.host = msg;
+        else if (msg.includes('port')) this.formErrors.port = msg;
+        else if (msg.includes('interval')) this.formErrors.interval_ms = msg;
+        else if (msg.includes('timeout')) this.formErrors.timeout_ms = msg;
+        else this.formErrors._general = msg;
+      }
+    },
+
+    resetForm() {
+      this.form = {
+        protocol: 'http',
+        name: '',
+        url: '',
+        host: '',
+        port: 443,
+        method: 'GET',
+        expected_status: null,
+        interval_ms: 60000,
+        timeout_ms: 10000,
+      };
+      this.formErrors = {};
     },
 
     formatRelative(iso) {

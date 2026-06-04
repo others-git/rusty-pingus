@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const DEFAULT_CONFIG: &str = r#"# rusty-pingus configuration
-# Generated automatically — edit to add monitors and restart.
+# Generated automatically — edit to update app settings and restart.
+# Monitors are managed separately in monitors.toml (or via the web UI).
 
 [defaults]
-timeout_secs = 10
-interval_secs = 60
+timeout_ms = 10000
+interval_ms = 60000
 # retention_days = 90
 
 [web]
@@ -17,33 +17,11 @@ bind = "0.0.0.0:3000"
 [database]
 path = "./data/rusty-pingus.db"
 
-# --- Monitor examples (uncomment and edit) ---
-
-# HTTP monitor
-# [[monitors]]
-# protocol = "http"
-# name = "my-site"
-# url = "https://example.com"
-# interval_secs = 60
-# expected_status = 200
-
-# TCP monitor
-# [[monitors]]
-# protocol = "tcp"
-# name = "my-server"
-# host = "example.com"
-# port = 443
-# interval_secs = 30
-
-# ICMP monitor (requires elevated privileges)
-# [[monitors]]
-# protocol = "icmp"
-# name = "my-gateway"
-# host = "1.1.1.1"
-# interval_secs = 30
+[monitors]
+path = "./monitors.toml"
 "#;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub defaults: Defaults,
@@ -52,17 +30,39 @@ pub struct Config {
     #[serde(default)]
     pub database: DatabaseConfig,
     #[serde(default)]
-    pub monitors: Vec<MonitorConfig>,
+    pub monitors: MonitorsConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(from = "RawDefaults")]
 pub struct Defaults {
-    pub timeout_secs: Option<u64>,
-    pub interval_secs: Option<u64>,
+    pub timeout_ms: Option<u64>,
+    pub interval_ms: Option<u64>,
     pub retention_days: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Accepts both `*_ms` and legacy `*_secs` keys; legacy values are converted to
+/// milliseconds (×1000). The `*_ms` form wins when both are present.
+#[derive(Deserialize, Default)]
+struct RawDefaults {
+    #[serde(default)] timeout_ms: Option<u64>,
+    #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default)] interval_ms: Option<u64>,
+    #[serde(default)] interval_secs: Option<u64>,
+    #[serde(default)] retention_days: Option<u64>,
+}
+
+impl From<RawDefaults> for Defaults {
+    fn from(r: RawDefaults) -> Self {
+        Self {
+            timeout_ms: r.timeout_ms.or_else(|| r.timeout_secs.map(|s| s.saturating_mul(1000))),
+            interval_ms: r.interval_ms.or_else(|| r.interval_secs.map(|s| s.saturating_mul(1000))),
+            retention_days: r.retention_days,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebConfig {
     pub bind: String,
 }
@@ -73,7 +73,7 @@ impl Default for WebConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub path: String,
 }
@@ -84,72 +84,16 @@ impl Default for DatabaseConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "protocol", rename_all = "lowercase")]
-pub enum MonitorConfig {
-    Http(HttpMonitorConfig),
-    Tcp(TcpMonitorConfig),
-    Icmp(IcmpMonitorConfig),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorsConfig {
+    pub path: String,
 }
 
-impl MonitorConfig {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Http(c) => &c.name,
-            Self::Tcp(c) => &c.name,
-            Self::Icmp(c) => &c.name,
-        }
-    }
-
-    pub fn interval_secs(&self) -> u64 {
-        match self {
-            Self::Http(c) => c.interval_secs,
-            Self::Tcp(c) => c.interval_secs,
-            Self::Icmp(c) => c.interval_secs,
-        }
+impl Default for MonitorsConfig {
+    fn default() -> Self {
+        Self { path: "./monitors.toml".to_string() }
     }
 }
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct HttpMonitorConfig {
-    pub name: String,
-    pub url: String,
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_http_method")]
-    pub method: String,
-    pub expected_status: Option<u16>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-    pub body: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TcpMonitorConfig {
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct IcmpMonitorConfig {
-    pub name: String,
-    pub host: String,
-    #[serde(default = "default_interval")]
-    pub interval_secs: u64,
-    #[serde(default = "default_timeout")]
-    pub timeout_secs: u64,
-}
-
-fn default_interval() -> u64 { 60 }
-fn default_timeout() -> u64 { 10 }
-fn default_http_method() -> String { "GET".to_string() }
 
 pub fn load(path: &Path) -> Result<Config> {
     if !path.exists() {
@@ -160,36 +104,14 @@ pub fn load(path: &Path) -> Result<Config> {
             .with_context(|| format!("Could not write default config to: {}", path.display()))?;
         tracing::warn!(
             path = %path.display(),
-            "No config found — generated a default. Edit it to add monitors."
+            "No config found — generated a default. Edit it to configure the app."
         );
         return Ok(Config::default());
     }
 
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Could not read config file: {}", path.display()))?;
-    let mut config: Config = toml::from_str(&contents)
+    let config: Config = toml::from_str(&contents)
         .with_context(|| format!("Invalid TOML in config file: {}", path.display()))?;
-    apply_defaults(&mut config);
     Ok(config)
-}
-
-fn apply_defaults(config: &mut Config) {
-    let timeout = config.defaults.timeout_secs;
-    let interval = config.defaults.interval_secs;
-    for monitor in &mut config.monitors {
-        match monitor {
-            MonitorConfig::Http(c) => {
-                if let Some(t) = timeout { if c.timeout_secs == default_timeout() { c.timeout_secs = t; } }
-                if let Some(i) = interval { if c.interval_secs == default_interval() { c.interval_secs = i; } }
-            }
-            MonitorConfig::Tcp(c) => {
-                if let Some(t) = timeout { if c.timeout_secs == default_timeout() { c.timeout_secs = t; } }
-                if let Some(i) = interval { if c.interval_secs == default_interval() { c.interval_secs = i; } }
-            }
-            MonitorConfig::Icmp(c) => {
-                if let Some(t) = timeout { if c.timeout_secs == default_timeout() { c.timeout_secs = t; } }
-                if let Some(i) = interval { if c.interval_secs == default_interval() { c.interval_secs = i; } }
-            }
-        }
-    }
 }
