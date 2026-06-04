@@ -26,6 +26,20 @@ async fn serve_asset(uri: Uri) -> impl IntoResponse {
                 .body(Body::from(content.data))
                 .unwrap()
         }
+        // SPA fallback: any unmatched path under /monitors/* serves monitor.html
+        // so the Alpine.js app can read the name from location.pathname.
+        None if path.starts_with("monitors/") => {
+            match Assets::get("monitor.html") {
+                Some(content) => Response::builder()
+                    .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                    .body(Body::from(content.data))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("Not found"))
+                    .unwrap(),
+            }
+        }
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("Not found"))
