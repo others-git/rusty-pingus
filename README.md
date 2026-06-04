@@ -10,6 +10,8 @@ Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP
 - Web dashboard at `http://localhost:3000`
 - JSON API for programmatic access
 - Single self-contained binary
+- **Windows**: system tray icon, double-click to open dashboard, no console window
+- Auto-generates a default `config.toml` on first run
 
 ## Installation
 
@@ -100,6 +102,21 @@ interval_secs = 30
 # Set log level
 RUST_LOG=debug ./rusty-pingus
 ```
+
+## Windows
+
+### System tray
+Double-click `rusty-pingus.exe` from Explorer or your Downloads folder. A cyan icon appears in the system tray (notification area, bottom-right). No console window opens.
+
+- **Left-click** the tray icon → opens the dashboard in your default browser
+- **Right-click** → "Open Dashboard" or "Quit"
+- On **first launch** (no existing database), the dashboard opens automatically
+
+### Logs
+Release builds write logs to `<data_dir>/logs/rusty-pingus.YYYY-MM-DD.log` (default: `./data/logs/`). For debug output, run from a terminal using a debug build (`cargo run`).
+
+### First run / missing config
+If no `config.toml` is present, rusty-pingus generates a default one and starts with zero monitors. Edit the generated file and restart to add monitors.
 
 ## ICMP Privileges
 

@@ -3,7 +3,47 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+pub const DEFAULT_CONFIG: &str = r#"# rusty-pingus configuration
+# Generated automatically — edit to add monitors and restart.
+
+[defaults]
+timeout_secs = 10
+interval_secs = 60
+# retention_days = 90
+
+[web]
+bind = "0.0.0.0:3000"
+
+[database]
+path = "./data/rusty-pingus.db"
+
+# --- Monitor examples (uncomment and edit) ---
+
+# HTTP monitor
+# [[monitors]]
+# protocol = "http"
+# name = "my-site"
+# url = "https://example.com"
+# interval_secs = 60
+# expected_status = 200
+
+# TCP monitor
+# [[monitors]]
+# protocol = "tcp"
+# name = "my-server"
+# host = "example.com"
+# port = 443
+# interval_secs = 30
+
+# ICMP monitor (requires elevated privileges)
+# [[monitors]]
+# protocol = "icmp"
+# name = "my-gateway"
+# host = "1.1.1.1"
+# interval_secs = 30
+"#;
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub defaults: Defaults,
@@ -112,6 +152,19 @@ fn default_timeout() -> u64 { 10 }
 fn default_http_method() -> String { "GET".to_string() }
 
 pub fn load(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(path, DEFAULT_CONFIG)
+            .with_context(|| format!("Could not write default config to: {}", path.display()))?;
+        tracing::warn!(
+            path = %path.display(),
+            "No config found — generated a default. Edit it to add monitors."
+        );
+        return Ok(Config::default());
+    }
+
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Could not read config file: {}", path.display()))?;
     let mut config: Config = toml::from_str(&contents)

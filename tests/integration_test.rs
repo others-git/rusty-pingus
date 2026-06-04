@@ -1,4 +1,4 @@
-use rusty_pingus::{config::TcpMonitorConfig, db, probe};
+use rusty_pingus::{config, config::TcpMonitorConfig, db, probe};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -134,4 +134,37 @@ async fn history_query_returns_ordered_results() {
     for w in history.windows(2) {
         assert!(w[0].checked_at >= w[1].checked_at, "results should be newest-first");
     }
+}
+
+#[test]
+fn missing_config_generates_default_and_returns_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+
+    assert!(!config_path.exists(), "precondition: file should not exist");
+
+    let cfg = config::load(&config_path).expect("load should succeed with missing file");
+
+    // File should now be written
+    assert!(config_path.exists(), "default config should have been written");
+
+    // Returned config should have defaults with zero monitors
+    assert!(cfg.monitors.is_empty(), "default config has no monitors");
+    assert_eq!(cfg.web.bind, "0.0.0.0:3000");
+
+    // The written file should be valid TOML that parses without error
+    let reloaded = config::load(&config_path).expect("reloaded default config should be valid");
+    assert!(reloaded.monitors.is_empty());
+}
+
+#[test]
+fn existing_config_not_overwritten() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+
+    // Write a custom config
+    std::fs::write(&config_path, "[web]\nbind = \"127.0.0.1:9999\"\n").unwrap();
+
+    let cfg = config::load(&config_path).expect("load");
+    assert_eq!(cfg.web.bind, "127.0.0.1:9999", "existing config should be respected");
 }

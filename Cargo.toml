@@ -17,9 +17,15 @@ clap = { version = "4", features = ["derive"] }
 rust-embed = { version = "8", features = ["axum"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 mime_guess = "2"
+webbrowser = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.14"
+windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
