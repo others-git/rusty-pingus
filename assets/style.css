@@ -1,0 +1,8 @@
+/* Chart.js canvas — needs explicit height since Tailwind doesn't set it */
+.chart-canvas-wrap {
+  position: relative;
+  height: 220px;
+}
+
+/* Ensure no text-decoration bleeds into card links */
+a { text-decoration: none; }

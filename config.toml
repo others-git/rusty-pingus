@@ -1,0 +1,40 @@
+# rusty-pingus configuration
+
+[defaults]
+timeout_secs = 10
+interval_secs = 60
+# retention_days = 90
+
+[web]
+bind = "0.0.0.0:3000"
+
+[database]
+path = "./data/rusty-pingus.db"
+
+# HTTP monitor example
+[[monitors]]
+protocol = "http"
+name = "example-https"
+url = "https://example.com"
+interval_secs = 60
+timeout_secs = 10
+method = "GET"
+expected_status = 200
+# headers = { "Authorization" = "Bearer token" }
+
+# TCP monitor example
+[[monitors]]
+protocol = "tcp"
+name = "example-tcp"
+host = "example.com"
+port = 443
+interval_secs = 30
+timeout_secs = 5
+
+# ICMP monitor example (requires CAP_NET_RAW or root)
+[[monitors]]
+protocol = "icmp"
+name = "example-icmp"
+host = "1.1.1.1"
+interval_secs = 30
+timeout_secs = 5
