@@ -243,14 +243,14 @@
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="block text-xs font-medium text-slate-400 mb-1">Interval (ms)</label>
-              <input x-model.number="form.interval_ms" type="number" step="1000"
+              <input x-model.number="form.interval_ms" type="number" min="1" step="1"
                      class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                      :class="formErrors.interval_ms ? 'border-red-500' : 'border-slate-700'" />
               <p x-show="formErrors.interval_ms" x-text="formErrors.interval_ms" class="text-red-400 text-xs mt-1"></p>
             </div>
             <div>
               <label class="block text-xs font-medium text-slate-400 mb-1">Timeout (ms)</label>
-              <input x-model.number="form.timeout_ms" type="number" step="1000"
+              <input x-model.number="form.timeout_ms" type="number" min="1" step="1"
                      class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                      :class="formErrors.timeout_ms ? 'border-red-500' : 'border-slate-700'" />
               <p x-show="formErrors.timeout_ms" x-text="formErrors.timeout_ms" class="text-red-400 text-xs mt-1"></p>
