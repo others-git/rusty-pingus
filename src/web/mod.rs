@@ -2,15 +2,14 @@ use axum::{
     body::Body,
     http::{header, Response, StatusCode, Uri},
     response::IntoResponse,
-    routing::get,
+    routing::{delete, get, post},
     Router,
 };
 use rust_embed::Embed;
-use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::api;
+use crate::api::{self, AppState};
 
 #[derive(Embed)]
 #[folder = "assets/"]
@@ -27,7 +26,6 @@ async fn serve_asset(uri: Uri) -> impl IntoResponse {
                 .unwrap()
         }
         // SPA fallback: any unmatched path under /monitors/* serves monitor.html
-        // so the Alpine.js app can read the name from location.pathname.
         None if path.starts_with("monitors/") => {
             match Assets::get("monitor.html") {
                 Some(content) => Response::builder()
@@ -73,15 +71,21 @@ async fn serve_monitor_page() -> impl IntoResponse {
     }
 }
 
-pub async fn serve(bind: String, pool: SqlitePool, cancel: CancellationToken) {
+pub async fn serve(bind: String, state: AppState, cancel: CancellationToken) {
     let app = Router::new()
         .route("/", get(serve_index))
-        .route("/monitors/{name}", get(serve_monitor_page))
+        .route("/monitors/:name", get(serve_monitor_page))
+        // Probe status API (read-only, derived from probe_results)
         .route("/api/monitors", get(api::list_monitors))
-        .route("/api/monitors/{name}/history", get(api::monitor_history))
-        .route("/api/monitors/{name}/uptime", get(api::monitor_uptime))
+        .route("/api/monitors/:name/history", get(api::monitor_history))
+        .route("/api/monitors/:name/uptime", get(api::monitor_uptime))
+        // Monitor config CRUD
+        .route("/api/monitors/config", get(api::list_monitor_configs))
+        .route("/api/monitors", post(api::add_monitor))
+        .route("/api/monitors/:name", delete(api::delete_monitor))
+        // Static assets catch-all
         .route("/*path", get(serve_asset))
-        .with_state(pool);
+        .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,

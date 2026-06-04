@@ -1,4 +1,4 @@
-use rusty_pingus::{config, config::TcpMonitorConfig, db, probe};
+use rusty_pingus::{config, monitors::TcpMonitorConfig, db, probe};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -31,8 +31,8 @@ async fn tcp_probe_up_stored_in_db() {
         name: "test-tcp".into(),
         host: "127.0.0.1".into(),
         port: addr.port(),
-        interval_secs: 60,
-        timeout_secs: 5,
+        interval_ms: 60_000,
+        timeout_ms: 5_000,
     };
 
     let result = probe::tcp::run(&cfg).await;
@@ -65,8 +65,8 @@ async fn tcp_probe_down_stored_in_db() {
         name: "test-tcp-down".into(),
         host: "127.0.0.1".into(),
         port: refused_port,
-        interval_secs: 60,
-        timeout_secs: 2,
+        interval_ms: 60_000,
+        timeout_ms: 2_000,
     };
 
     let result = probe::tcp::run(&cfg).await;
@@ -148,13 +148,13 @@ fn missing_config_generates_default_and_returns_empty() {
     // File should now be written
     assert!(config_path.exists(), "default config should have been written");
 
-    // Returned config should have defaults with zero monitors
-    assert!(cfg.monitors.is_empty(), "default config has no monitors");
+    // monitors field is now MonitorsConfig (path), not a Vec
+    assert!(!cfg.monitors.path.is_empty(), "monitors path should be set");
     assert_eq!(cfg.web.bind, "0.0.0.0:3000");
 
     // The written file should be valid TOML that parses without error
     let reloaded = config::load(&config_path).expect("reloaded default config should be valid");
-    assert!(reloaded.monitors.is_empty());
+    assert!(!reloaded.monitors.path.is_empty());
 }
 
 #[test]

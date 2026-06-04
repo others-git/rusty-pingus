@@ -138,6 +138,15 @@ pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result
     Ok(result.rows_affected())
 }
 
+/// Delete all stored probe results for a monitor. Returns the number of rows removed.
+pub async fn delete_results(pool: &SqlitePool, monitor_name: &str) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM probe_results WHERE monitor_name = ?")
+        .bind(monitor_name)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn monitor_exists(pool: &SqlitePool, monitor_name: &str) -> Result<bool> {
     let row = sqlx::query("SELECT COUNT(*) as cnt FROM probe_results WHERE monitor_name = ?")
         .bind(monitor_name)

@@ -11,7 +11,8 @@ Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP
 - JSON API for programmatic access
 - Single self-contained binary
 - **Windows**: system tray icon, double-click to open dashboard, no console window
-- Auto-generates a default `config.toml` on first run
+- Add and remove monitors via the web UI — no config file editing required
+- Auto-generates default config files on first run
 
 ## Installation
 
@@ -22,12 +23,33 @@ cp target/release/rusty-pingus /usr/local/bin/
 
 ## Configuration
 
+Configuration is split into two files:
+
+| File | Purpose |
+|---|---|
+| `config.toml` | App settings: bind address, database path, defaults, log retention |
+| `monitors.toml` | Monitor definitions: managed by the web UI or edited directly |
+
+Both files are auto-generated with commented examples on first run.
+
+### Timing units (milliseconds)
+
+Monitor `interval` and `timeout` are configured in **milliseconds** via the `interval_ms` and `timeout_ms` fields. Validation requires `interval_ms ≥ 5000`, `timeout_ms ≥ 1000`, and `timeout_ms < interval_ms`.
+
+Older files that use the legacy `interval_secs` / `timeout_secs` keys are still accepted: their values are converted to milliseconds (×1000) on startup, the file is rewritten in the `*_ms` form, and a warning is logged. When both forms are present for the same field, the `*_ms` value wins.
+
+### Migration from single config.toml
+
+If you have an existing `config.toml` with `[[monitors]]` entries (from v0.0.1), rusty-pingus will automatically migrate them to `monitors.toml` on startup and remove the entries from `config.toml`.
+
+### config.toml
+
 Create a `config.toml` (see `config.toml` in this repo for a full example):
 
 ```toml
 [defaults]
-timeout_secs = 10
-interval_secs = 60
+timeout_ms = 10000
+interval_ms = 60000
 # retention_days = 90   # Uncomment to prune results older than N days
 
 [web]
@@ -41,7 +63,7 @@ path = "./data/rusty-pingus.db"
 protocol = "http"
 name = "my-api"
 url = "https://api.example.com/health"
-interval_secs = 30
+interval_ms = 30000
 expected_status = 200
 
 # TCP monitor
@@ -50,22 +72,22 @@ protocol = "tcp"
 name = "my-db"
 host = "db.example.com"
 port = 5432
-interval_secs = 60
+interval_ms = 60000
 
 # ICMP monitor (requires elevated privileges — see below)
 [[monitors]]
 protocol = "icmp"
 name = "gateway"
 host = "192.168.1.1"
-interval_secs = 30
+interval_ms = 30000
 ```
 
 ### Configuration Reference
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `[defaults].timeout_secs` | integer | 10 | Default probe timeout |
-| `[defaults].interval_secs` | integer | 60 | Default probe interval |
+| `[defaults].timeout_ms` | integer | 10000 | Default probe timeout (ms) |
+| `[defaults].interval_ms` | integer | 60000 | Default probe interval (ms) |
 | `[defaults].retention_days` | integer | — | Delete results older than N days |
 | `[web].bind` | string | `0.0.0.0:3000` | Web server bind address |
 | `[database].path` | string | `./data/rusty-pingus.db` | SQLite file path |
@@ -76,16 +98,16 @@ interval_secs = 30
 |---|---|---|---|
 | `name` | string | yes | Unique monitor name |
 | `url` | string | yes | Target URL |
-| `interval_secs` | integer | no | Probe interval (overrides default) |
-| `timeout_secs` | integer | no | Probe timeout (overrides default) |
+| `interval_ms` | integer | no | Probe interval in ms (overrides default) |
+| `timeout_ms` | integer | no | Probe timeout in ms (overrides default) |
 | `method` | string | no | HTTP method (default: `GET`) |
 | `expected_status` | integer | no | Expected HTTP status (default: any 2xx) |
 | `headers` | map | no | Request headers |
 | `body` | string | no | Request body |
 
-**TCP monitor fields:** `name`, `host`, `port`, `interval_secs`, `timeout_secs`
+**TCP monitor fields:** `name`, `host`, `port`, `interval_ms`, `timeout_ms`
 
-**ICMP monitor fields:** `name`, `host`, `interval_secs`, `timeout_secs`
+**ICMP monitor fields:** `name`, `host`, `interval_ms`, `timeout_ms`
 
 ## Running
 
@@ -99,9 +121,14 @@ interval_secs = 30
 # Override bind/db path
 ./rusty-pingus --bind 127.0.0.1:8080 --db /var/lib/rusty-pingus/db.sqlite
 
+# Override the monitors file location (default: ./monitors.toml)
+./rusty-pingus --monitors /etc/rusty-pingus/monitors.toml
+
 # Set log level
 RUST_LOG=debug ./rusty-pingus
 ```
+
+The `--monitors` flag overrides the monitors file path from `config.toml`. Monitors added or removed via the web UI are written back to this file automatically.
 
 ## Windows
 

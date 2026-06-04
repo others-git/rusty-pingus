@@ -2,12 +2,12 @@ use std::time::{Duration, Instant};
 use reqwest::{Client, Method};
 use tracing::debug;
 
-use crate::config::HttpMonitorConfig;
+use crate::monitors::HttpMonitorConfig;
 use super::ProbeResult;
 
 pub async fn run(cfg: &HttpMonitorConfig) -> ProbeResult {
     let client = match Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_secs))
+        .timeout(Duration::from_millis(cfg.timeout_ms))
         .build()
     {
         Ok(c) => c,
