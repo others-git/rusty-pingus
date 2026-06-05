@@ -4,28 +4,34 @@ function monitorDetail() {
   const RAW_LIMIT = 1000;   // max raw probes to render individually
   const BUCKET_TARGET = 300;
   const REFETCH_DEBOUNCE_MS = 300;
+  const SUSTAINED_MS = 60_000; // outages >= this are drawn as a fat labeled band
+
+  // ── Non-reactive state (closure) ──────────────────────────────────────────
+  // The ECharts instance and chart data are kept OUT of Alpine's reactive object:
+  // a chart instance is full of circular refs, and proxying it makes the library
+  // recurse over reactive get-traps until the stack overflows.
+  let chart = null;
+  let lineData = [];        // [[tsMs, y|null], ...]
+  let downIntervals = [];   // [[startMs, endMs], ...]
+  let windowFrom = null, windowTo = null; // ms; the fixed axis extent (active window)
+  let refetchSeq = 0;
+  let debounceTimer = null;
+  let isApplying = false;   // guard: programmatic setOption/dispatch must not refetch
+  let resizeBound = false;
 
   return {
     monitorName: decodeURIComponent(location.pathname.replace(/^\/monitors\//, '')),
     currentStatus: null,
     loading: true,
-    history: [],
-    points: [],
-    lossPoints: [],
-    lossCount: 0,
-    chart: null,
-    chartMode: 'series',     // 'series' | 'raw'
     activeWindow: '24h',
     lastResponseMs: null,
     lastCheckedAt: null,
     uptime24h: null,
     sampleCount: 0,
+    lossCount: 0,
+    chartMode: 'series',
     isLoadingDetail: false,
-    windowFrom: null,        // ms; full extent of the active window (max zoom-out)
-    windowTo: null,
-    _isApplying: false,      // guard: programmatic chart updates must not refetch
-    _refetchSeq: 0,          // stale-response guard
-    _debounceTimer: null,
+    hasData: false,
     uptimeWindows: [
       { label: '1h',  key: 'uptime_1h',  value: null },
       { label: '24h', key: 'uptime_24h', value: null },
@@ -41,19 +47,14 @@ function monitorDetail() {
         fetch(`/api/monitors/${name}/history?limit=100`),
         fetch(`/api/monitors/${name}/uptime`),
       ]);
+      if (!histRes.ok) { this.currentStatus = 'not_found'; this.loading = false; return; }
 
-      if (!histRes.ok) {
-        this.currentStatus = 'not_found';
-        this.loading = false;
-        return;
-      }
-
-      this.history = await histRes.json();
+      const history = await histRes.json();
       const uptime = uptimeRes.ok ? await uptimeRes.json() : {};
       for (const w of this.uptimeWindows) w.value = uptime[w.key] ?? null;
       this.uptime24h = uptime.uptime_24h ?? null;
 
-      const latest = this.history[0];
+      const latest = history[0];
       this.currentStatus = latest ? latest.status : 'pending';
       this.lastResponseMs = latest ? latest.response_time_ms : null;
       this.lastCheckedAt = latest ? latest.checked_at : null;
@@ -62,256 +63,181 @@ function monitorDetail() {
       this.$nextTick(() => this.selectWindow(this.activeWindow));
     },
 
-    // Select a window: fetch its data and fit the chart's x-axis to that data so
-    // it fills the plot area. The window only governs what data is fetched — it
-    // does not pin the axis or the pan range.
+    // Select a window: it fixes the chart's time axis and loads the window's data.
     async selectWindow(label) {
       this.activeWindow = label;
       const secs = WINDOW_SECS[label] ?? 86400;
-      this.windowTo = Date.now();
-      this.windowFrom = this.windowTo - secs * 1000;
-      await this.loadRange(this.windowFrom, this.windowTo, /* fit axis to data */ true);
+      windowTo = Date.now();
+      windowFrom = windowTo - secs * 1000;
+      await this.loadRange(windowFrom, windowTo, /* reset view to full window */ true);
     },
 
-    // Fetch data at a resolution matched to the visible range and update the chart.
-    // Uses raw probes when the range holds few enough; otherwise aggregated buckets.
-    async loadRange(fromMs, toMs, fit = false) {
+    // Fetch data at a resolution matched to the range, then render.
+    async loadRange(fromMs, toMs, resetView = false) {
       const name = encodeURIComponent(this.monitorName);
       const to = Math.min(toMs, Date.now());
       const from = Math.min(fromMs, to - 1000);
       const fromIso = new Date(from).toISOString();
       const toIso = new Date(to).toISOString();
 
-      const seq = ++this._refetchSeq;
+      const seq = ++refetchSeq;
       this.isLoadingDetail = true;
       try {
-        // Fetch the aggregated series first. It scans the whole range (uncapped),
-        // so the summed bucket counts give the true number of probes in range —
-        // unlike /history, whose limit is server-capped at 1000.
+        // Series first: it counts the whole range (uncapped), unlike /history.
         const serUrl = `/api/monitors/${name}/series?from=${encodeURIComponent(fromIso)}`
           + `&to=${encodeURIComponent(toIso)}&buckets=${BUCKET_TARGET}`;
-        const serRes = await fetch(serUrl);
-        const series = serRes.ok ? await serRes.json() : [];
-        if (seq !== this._refetchSeq) return; // a newer request superseded us
+        const series = await (await fetch(serUrl)).json().catch(() => []);
+        if (seq !== refetchSeq) return;
         const total = series.reduce((acc, b) => acc + (b.count || 0), 0);
 
+        let downFlags;
         if (total > 0 && total <= RAW_LIMIT) {
-          // Sparse enough → fetch every probe in range and show them individually.
           const histUrl = `/api/monitors/${name}/history?from=${encodeURIComponent(fromIso)}`
             + `&to=${encodeURIComponent(toIso)}&limit=${RAW_LIMIT}`;
-          const histRes = await fetch(histUrl);
-          const rows = histRes.ok ? await histRes.json() : [];
-          if (seq !== this._refetchSeq) return;
-          const asc = [...rows].reverse(); // history is newest-first
-          this.points = asc.map(r => ({ x: r.checked_at, y: r.response_time_ms }));
-          this._pointMeta = asc.map(r => ({ down: r.status === 'down', reason: r.failure_reason }));
+          const rows = await (await fetch(histUrl)).json().catch(() => []);
+          if (seq !== refetchSeq) return;
+          const asc = [...rows].reverse();
+          lineData = asc.map(r => [Date.parse(r.checked_at), r.response_time_ms]);
+          downFlags = asc.map(r => r.status === 'down');
           this.chartMode = 'raw';
           this.sampleCount = rows.length;
         } else {
-          this.points = series.map(b => ({ x: b.ts, y: b.avg_ms }));
-          this._pointMeta = series.map(b => ({
-            down: b.up_ratio < 1, count: b.count, min: b.min_ms, max: b.max_ms, up_ratio: b.up_ratio,
-          }));
+          // For partial-loss buckets keep avg (line continues); fully-down buckets
+          // have a null avg, so the line breaks there.
+          lineData = series.map(b => [Date.parse(b.ts), b.avg_ms ?? null]);
+          downFlags = series.map(b => b.up_ratio < 1);
           this.chartMode = 'series';
           this.sampleCount = total;
         }
-        this.renderChart(fit);
+
+        downIntervals = computeDownIntervals(lineData, downFlags);
+        this.lossCount = downIntervals.length;
+        this.hasData = lineData.length > 0;
+        this.renderChart(resetView);
       } catch (e) {
         console.error('loadRange failed', e);
       } finally {
-        if (seq === this._refetchSeq) this.isLoadingDetail = false;
+        if (seq === refetchSeq) this.isLoadingDetail = false;
       }
     },
 
-    scheduleRefetch(fromMs, toMs) {
-      if (this._debounceTimer) clearTimeout(this._debounceTimer);
-      this._debounceTimer = setTimeout(() => this.loadRange(fromMs, toMs, false), REFETCH_DEBOUNCE_MS);
+    renderChart(resetView) {
+      const el = document.getElementById('response-chart');
+      if (!el) return;
+      if (!chart) {
+        chart = echarts.init(el);
+        if (!resizeBound) {
+          window.addEventListener('resize', () => chart && chart.resize());
+          resizeBound = true;
+        }
+        // Debounced refetch on any user zoom/pan/slider gesture.
+        chart.on('datazoom', () => {
+          if (isApplying) return;
+          const dz = (chart.getOption().dataZoom || [])[0] || {};
+          const start = dz.start ?? 0, end = dz.end ?? 100;
+          const span = windowTo - windowFrom;
+          const fromMs = windowFrom + span * (start / 100);
+          const toMs = windowFrom + span * (end / 100);
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => this.loadRange(fromMs, toMs, false), REFETCH_DEBOUNCE_MS);
+        });
+      }
+
+      isApplying = true;
+      chart.setOption(this._chartOption(), { notMerge: false });
+      if (resetView) {
+        chart.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start: 0, end: 100 });
+      }
+      isApplying = false;
+    },
+
+    _chartOption() {
+      // Sustained outages → fat labeled band; every outage → a thin vertical line
+      // that stays visible (fixed pixel width) at any zoom and is hoverable.
+      const sustained = downIntervals.filter(([s, e]) => e - s >= SUSTAINED_MS);
+      const markArea = sustained.length ? {
+        silent: false,
+        itemStyle: { color: 'rgba(248,113,113,0.22)' },
+        label: {
+          show: true, color: '#fca5a5', fontSize: 10, position: 'insideTop',
+          formatter: (p) => p.name || '',
+        },
+        data: sustained.map(([s, e]) => [{ xAxis: s, name: fmtOutage(s, e) }, { xAxis: e }]),
+      } : undefined;
+      const markLine = downIntervals.length ? {
+        silent: false,
+        symbol: 'none',
+        lineStyle: { color: '#f87171', width: 1.5, opacity: 0.9 },
+        label: { show: false },
+        emphasis: { label: { show: true, color: '#fca5a5', formatter: (p) => p.name || '' } },
+        data: downIntervals.map(([s, e]) => ({
+          xAxis: s,
+          name: (e - s >= SUSTAINED_MS) ? fmtOutage(s, e) : new Date(s).toLocaleString(),
+        })),
+      } : undefined;
+
+      return {
+        backgroundColor: 'transparent',
+        textStyle: { color: '#94a3b8', fontFamily: 'Inter, system-ui, sans-serif' },
+        grid: { left: 48, right: 16, top: 16, bottom: 64 },
+        tooltip: {
+          trigger: 'axis',
+          backgroundColor: '#1e293b',
+          borderColor: '#334155',
+          textStyle: { color: '#f1f5f9' },
+          formatter: (params) => {
+            const arr = Array.isArray(params) ? params : [params];
+            if (!arr.length) return '';
+            const p = arr[0];
+            const tsMs = p.axisValue != null ? p.axisValue
+              : (Array.isArray(p.value) ? p.value[0] : null);
+            const y = Array.isArray(p.value) ? p.value[1] : null;
+            const time = tsMs != null ? new Date(tsMs).toLocaleString() : '';
+            const body = y == null ? 'no response' : `${Math.round(y)} ms`;
+            return time ? `${time}<br/>${body}` : body;
+          },
+        },
+        xAxis: {
+          type: 'time',
+          min: windowFrom,
+          max: windowTo,
+          axisLine: { lineStyle: { color: '#334155' } },
+          axisLabel: { color: '#64748b', fontSize: 11, hideOverlap: true },
+          splitLine: { show: false },
+        },
+        yAxis: {
+          type: 'value',
+          min: 0,
+          name: 'ms',
+          nameTextStyle: { color: '#64748b' },
+          axisLabel: { color: '#64748b', fontSize: 11 },
+          splitLine: { lineStyle: { color: 'rgba(51,65,85,0.5)' } },
+        },
+        dataZoom: [
+          { type: 'inside', xAxisIndex: 0, filterMode: 'none', minValueSpan: 10_000 },
+          { type: 'slider', xAxisIndex: 0, filterMode: 'none', height: 22, bottom: 16,
+            borderColor: '#334155', fillerColor: 'rgba(34,211,238,0.15)',
+            dataBackground: { lineStyle: { color: '#334155' }, areaStyle: { color: '#1e293b' } },
+            textStyle: { color: '#64748b' }, handleStyle: { color: '#22d3ee' } },
+        ],
+        series: [{
+          type: 'line',
+          showSymbol: false,
+          connectNulls: false,
+          smooth: true,
+          lineStyle: { color: '#22d3ee', width: 2 },
+          itemStyle: { color: '#22d3ee' },
+          areaStyle: { color: 'rgba(34,211,238,0.10)' },
+          data: lineData,
+          markArea,
+          markLine,
+        }],
+      };
     },
 
     resetZoom() {
-      // Snap back to the full active window (also reloads it at window resolution).
+      // Back to the full active window (also reloads it at window resolution).
       this.selectWindow(this.activeWindow);
-    },
-
-    // Down probes (raw) / buckets with loss (series) plotted as red markers along
-    // the baseline so packet loss is visible on the chart.
-    _computeLoss() {
-      const pts = [];
-      for (let i = 0; i < this.points.length; i++) {
-        const m = this._pointMeta[i];
-        if (m && m.down) pts.push({ x: this.points[i].x, y: 0 });
-      }
-      this.lossPoints = pts;
-      this.lossCount = pts.length;
-    },
-
-    _mainRadius() {
-      return this.points.length > 120 ? 0 : 2;
-    },
-
-    _lossRadius() {
-      return this.chartMode === 'raw' ? 4 : 3;
-    },
-
-    // [minMs, maxMs] of the loaded points, with small padding so edge points
-    // aren't clipped. Used to fit the axis to the data on a fresh window load.
-    _dataExtent() {
-      if (!this.points.length) return null;
-      const first = Date.parse(this.points[0].x);
-      const last = Date.parse(this.points[this.points.length - 1].x);
-      const pad = Math.max(1000, (last - first) * 0.02);
-      return [first - pad, last + pad];
-    },
-
-    renderChart(fit = false) {
-      const canvas = document.getElementById('response-chart');
-      if (!canvas) return;
-
-      this._computeLoss();
-
-      // Always update the single chart instance in place — never destroy/recreate.
-      // Destroying nulls the canvas context while the zoom plugin may still have a
-      // throttled update pending, which then crashes in clipArea (ctx null).
-      if (this.chart) {
-        this._isApplying = true;
-        this.chart.data.datasets[0].data = this.points;
-        this.chart.data.datasets[0].pointRadius = this._mainRadius();
-        this.chart.data.datasets[1].data = this.lossPoints;
-        this.chart.data.datasets[1].pointRadius = this._lossRadius();
-        // Only a fresh window load re-fits the axis to its data; zoom/pan refetches
-        // leave the view exactly where the user's gesture left it.
-        if (fit) {
-          const ext = this._dataExtent();
-          this.chart.options.scales.x.min = ext ? ext[0] : undefined;
-          this.chart.options.scales.x.max = ext ? ext[1] : undefined;
-        }
-        this.chart.update('none');
-        this._isApplying = false;
-        return;
-      }
-
-      if (!this.points.length) return;
-
-      const ext = this._dataExtent(); // fit the initial view to the loaded data
-
-      // NOTE: no `fill` — Chart.js's DatasetController.initialize() calls
-      // isPluginEnabled('filler') when fill is set, and the zoom plugin's
-      // re-entrant update() can reconstruct the controller while the plugin
-      // cache is momentarily undefined, throwing. A plain line avoids that path.
-      this.chart = new Chart(canvas, {
-        type: 'line',
-        data: {
-          datasets: [
-            {
-              label: 'Response (ms)',
-              data: this.points,
-              borderColor: '#22d3ee',
-              backgroundColor: 'rgba(34,211,238,0.15)',
-              borderWidth: 2,
-              pointBackgroundColor: '#22d3ee',
-              pointRadius: this._mainRadius(),
-              pointHoverRadius: 4,
-              tension: 0.3,
-              fill: false,
-              spanGaps: true,
-            },
-            {
-              label: 'Packet loss',
-              data: this.lossPoints,
-              showLine: false,
-              pointStyle: 'circle',
-              pointBackgroundColor: '#f87171',
-              pointBorderColor: '#f87171',
-              pointRadius: this._lossRadius(),
-              pointHoverRadius: 5,
-            },
-          ],
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          animation: false,
-          plugins: {
-            legend: { display: false },
-            tooltip: {
-              mode: 'index',
-              intersect: false,
-              backgroundColor: '#1e293b',
-              titleColor: '#94a3b8',
-              bodyColor: '#f1f5f9',
-              borderColor: '#334155',
-              borderWidth: 1,
-              callbacks: {
-                title: items => items.length ? new Date(items[0].parsed.x).toLocaleString() : '',
-                label: c => {
-                  if (c.datasetIndex === 1) {
-                    return this.chartMode === 'raw' ? 'packet lost (no reply)' : 'loss in this interval';
-                  }
-                  return this._tooltipLabel(c.dataIndex, c.parsed.y);
-                },
-              },
-            },
-            zoom: {
-              // NOTE: pinch is intentionally omitted — it requires Hammer.js, and
-              // enabling it without Hammer loaded throws during the plugin's event
-              // setup, which prevents the mouse drag-to-pan listeners from attaching.
-              zoom: {
-                wheel: { enabled: true },
-                mode: 'x',
-                onZoomComplete: ({ chart }) => this._onViewChange(chart),
-              },
-              pan: {
-                enabled: true,
-                mode: 'x',
-                onPanComplete: ({ chart }) => this._onViewChange(chart),
-              },
-              // No `limits`: clamping the view to the window leaves no room to pan.
-              // minRange caps how far the user can zoom in.
-              limits: {
-                x: { minRange: 10_000 },
-              },
-            },
-          },
-          scales: {
-            x: {
-              type: 'time',
-              min: ext ? ext[0] : undefined,
-              max: ext ? ext[1] : undefined,
-              ticks: { maxTicksLimit: 8, color: '#64748b', font: { size: 11 } },
-              grid: { display: false },
-              border: { display: false },
-            },
-            y: {
-              beginAtZero: true,
-              ticks: { color: '#64748b', font: { size: 11 } },
-              grid: { color: 'rgba(51,65,85,0.5)' },
-              border: { display: false },
-            },
-          },
-        },
-      });
-    },
-
-    // Refetch for the newly visible range — ignore programmatic updates.
-    _onViewChange(chart) {
-      if (this._isApplying) return;
-      const { min, max } = chart.scales.x;
-      if (min == null || max == null) return;
-      this.scheduleRefetch(min, max);
-    },
-
-    _tooltipLabel(i, y) {
-      const m = this._pointMeta[i] || {};
-      if (this.chartMode === 'raw') {
-        const out = [y != null ? `${y} ms` : (m.down ? 'down' : '—')];
-        if (m.down && m.reason) out.push(m.reason);
-        return out;
-      }
-      const out = [`avg ${y != null ? Math.round(y) : '—'} ms`];
-      if (m.min != null && m.max != null) out.push(`min ${m.min} / max ${m.max} ms`);
-      if (m.count != null) out.push(`${m.count} sample${m.count === 1 ? '' : 's'}`);
-      if (m.up_ratio != null && m.up_ratio < 1) out.push(`${(m.up_ratio * 100).toFixed(0)}% up`);
-      return out;
     },
 
     // SVG gauge helpers
@@ -319,18 +245,12 @@ function monitorDetail() {
       if (value == null) return CIRCUMFERENCE;
       return CIRCUMFERENCE * (1 - Math.max(0, Math.min(100, value)) / 100);
     },
-
     gaugeColor(value) {
       if (value == null) return '#334155';
       if (value >= 99) return '#34d399';
       if (value >= 90) return '#fbbf24';
       return '#f87171';
     },
-
-    formatTime(iso) {
-      return new Date(iso).toLocaleString();
-    },
-
     formatRelative(iso) {
       const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
       if (diff < 10) return 'just now';
@@ -339,7 +259,38 @@ function monitorDetail() {
       if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
       return `${Math.floor(diff / 86400)}d ago`;
     },
-
-    _pointMeta: [],
   };
+}
+
+function fmtDuration(ms) {
+  const s = Math.max(1, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), rs = s % 60;
+  if (m < 60) return rs ? `${m}m${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return rm ? `${h}h${rm}m` : `${h}h`;
+}
+
+// "14:03:20 · 1m40s" — outage start time + duration, for sustained-outage labels.
+function fmtOutage(startMs, endMs) {
+  return `${new Date(startMs).toLocaleTimeString()} · ${fmtDuration(endMs - startMs)}`;
+}
+
+// Merge consecutive down samples into [startMs, endMs] spans for the red bands.
+function computeDownIntervals(lineData, downFlags) {
+  const out = [];
+  const n = lineData.length;
+  for (let i = 0; i < n; i++) {
+    if (!downFlags[i]) continue;
+    const start = lineData[i][0];
+    // End at the next sample's time (so the band has width), or extrapolate.
+    let end;
+    if (i + 1 < n) end = lineData[i + 1][0];
+    else if (i > 0) end = start + (lineData[i][0] - lineData[i - 1][0]);
+    else end = start + 1000;
+    const last = out[out.length - 1];
+    if (last && start <= last[1]) last[1] = Math.max(last[1], end);
+    else out.push([start, end]);
+  }
+  return out;
 }

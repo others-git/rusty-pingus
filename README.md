@@ -8,7 +8,7 @@ Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP
 - Per-monitor configurable intervals and timeouts
 - SQLite persistence with automatic migrations
 - Web dashboard at `http://localhost:3000`
-- Monitor detail chart with zoom/pan that loads finer detail as you zoom in — down to individual probes once the visible range is small enough
+- Monitor detail chart (Apache ECharts) with built-in zoom/pan and a range slider, dynamic resolution (loads finer detail as you zoom in, down to individual probes), and downtime shown as a gap in the line plus a red band
 - JSON API for programmatic access
 - Single self-contained binary
 - **Windows**: system tray icon, double-click to open dashboard, no console window
@@ -166,6 +166,8 @@ TCP and HTTP probes work without elevated privileges.
 - `GET /api/monitors/:name/history?from=<iso8601>&to=<iso8601>&limit=100` — raw probe history
 - `GET /api/monitors/:name/uptime` — uptime % for 1h, 24h, 7d, 30d windows
 - `GET /api/monitors/:name/series?from=<iso8601>&to=<iso8601>&buckets=300` — response time aggregated into a bounded number of time buckets (each: bucket start, avg/min/max ms, sample count, up-ratio). Used by the monitor detail chart so any window stays fast regardless of poll interval. `buckets` is clamped to 50–1000; defaults are the last 24h with ~300 buckets.
+
+Wide chart windows and long uptime windows (7d/30d) are served from **per-minute rollups** (a background task aggregates `probe_results` into a `probe_rollup_1m` table), so their cost scales with minutes rather than the raw row count — important at low poll intervals. Fine/recent ranges still read raw results, and queries fall back to raw until the rollup has backfilled.
 
 ## systemd
 

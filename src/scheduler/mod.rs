@@ -136,6 +136,52 @@ pub async fn retention_loop(pool: SqlitePool, retention_days: u64, cancel: Cance
                     Ok(n) => info!(deleted = n, "Pruned old probe results"),
                     Err(e) => error!(error = %e, "Retention cleanup failed"),
                 }
+                if let Err(e) = db::prune_old_rollups(&pool, retention_days).await {
+                    error!(error = %e, "Rollup retention cleanup failed");
+                }
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
+}
+
+/// Keep the per-minute rollups current: on start, backfill from the rollup
+/// watermark (or earliest raw minute) up to now; then every ~30s roll up newly
+/// completed minutes. The current (incomplete) minute is excluded; the boundary
+/// minute is re-rolled via INSERT OR REPLACE so partials are corrected.
+pub async fn rollup_loop(pool: SqlitePool, cancel: CancellationToken) {
+    let current_minute = || (chrono::Utc::now().timestamp() / 60) * 60;
+
+    let mut next_from = match db::rollup_watermark(&pool).await {
+        Ok(Some(w)) => w, // re-roll from the last rolled minute (REPLACE handles partials/gaps)
+        Ok(None) => match db::earliest_raw_minute(&pool).await {
+            Ok(Some(m)) => m,
+            _ => current_minute(),
+        },
+        Err(e) => {
+            error!(error = %e, "Rollup watermark read failed");
+            current_minute()
+        }
+    };
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    info!(start = next_from, "Rollup maintenance loop started");
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let now_min = current_minute();
+                // Roll complete minutes [next_from, now_min) in day-sized chunks.
+                let mut from = next_from;
+                while from < now_min {
+                    let to = (from + 86_400).min(now_min);
+                    match db::roll_up_range(&pool, from, to).await {
+                        Ok(_) => { from = to; }
+                        Err(e) => { error!(error = %e, "Rollup aggregation failed"); break; }
+                    }
+                }
+                next_from = now_min;
             }
             _ = cancel.cancelled() => break,
         }

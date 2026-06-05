@@ -134,6 +134,27 @@ pub async fn get_uptime(
     monitor_name: &str,
     window_secs: i64,
 ) -> Result<Option<f64>> {
+    // Long windows are served from the per-minute rollup (bounded cost); short
+    // windows use raw rows (fast, and include the current minute).
+    if window_secs > 86_400 {
+        let from_epoch = (Utc::now() - chrono::Duration::seconds(window_secs)).timestamp();
+        let row = sqlx::query(
+            "SELECT SUM(count) AS total, SUM(up_count) AS up
+             FROM probe_rollup_1m WHERE monitor_name = ? AND bucket_epoch >= ?",
+        )
+        .bind(monitor_name)
+        .bind(from_epoch)
+        .fetch_one(pool)
+        .await?;
+        let total: i64 = row.try_get::<Option<i64>, _>("total")?.unwrap_or(0);
+        // If the rollup has data for this window, use it; otherwise (not yet
+        // backfilled) fall through to the raw computation below.
+        if total > 0 {
+            let up: i64 = row.try_get::<Option<i64>, _>("up")?.unwrap_or(0);
+            return Ok(Some((up as f64 / total as f64) * 100.0));
+        }
+    }
+
     let from = Utc::now() - chrono::Duration::seconds(window_secs);
     let from_str = from.to_rfc3339();
 
@@ -179,7 +200,20 @@ pub async fn get_series(
     // strictly bounded to `n` buckets regardless of volume or epoch alignment.
     let n = buckets.clamp(1, 5000);
     let from_epoch = from.timestamp();
-    let span_secs = (to.timestamp() - from_epoch).max(1);
+    let to_epoch = to.timestamp();
+    let span_secs = (to_epoch - from_epoch).max(1);
+
+    // When each output bucket spans >= 1 minute, serve from the per-minute rollup
+    // (cost scales with minutes, not raw rows). If the rollup has no data for the
+    // range yet (e.g. startup backfill not finished), fall back to the raw path so
+    // results are correct (just not yet fast). Finer ranges always use raw.
+    if span_secs / n >= 60 {
+        let rollup = get_series_rollup(pool, monitor_name, from_epoch, to_epoch, n, span_secs).await?;
+        if !rollup.is_empty() {
+            return Ok(rollup);
+        }
+    }
+
     let from_str = from.to_rfc3339();
     let to_str = to.to_rfc3339();
 
@@ -224,6 +258,114 @@ pub async fn get_series(
     Ok(out)
 }
 
+/// Rollup-backed series: aggregate per-minute rollups over `[from,to]` into `n`
+/// bounded buckets. avg = SUM(sum_ms)/SUM(up_count) (over successful probes).
+async fn get_series_rollup(
+    pool: &SqlitePool,
+    monitor_name: &str,
+    from_epoch: i64,
+    to_epoch: i64,
+    n: i64,
+    span_secs: i64,
+) -> Result<Vec<SeriesBucket>> {
+    let rows = sqlx::query(
+        "SELECT MIN(? - 1, (bucket_epoch - ?) * ? / ?) AS bucket,
+                SUM(sum_ms) AS sum_ms,
+                SUM(up_count) AS up_count,
+                MIN(min_ms) AS min_ms,
+                MAX(max_ms) AS max_ms,
+                SUM(count) AS cnt
+         FROM probe_rollup_1m
+         WHERE monitor_name = ? AND bucket_epoch >= ? AND bucket_epoch <= ?
+         GROUP BY bucket
+         ORDER BY bucket",
+    )
+    .bind(n)
+    .bind(from_epoch)
+    .bind(n)
+    .bind(span_secs)
+    .bind(monitor_name)
+    .bind(from_epoch)
+    .bind(to_epoch)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let bucket: i64 = row.try_get("bucket")?;
+        let cnt: i64 = row.try_get("cnt").unwrap_or(0);
+        let up_count: i64 = row.try_get("up_count").unwrap_or(0);
+        let sum_ms: i64 = row.try_get("sum_ms").unwrap_or(0);
+        let ts_epoch = from_epoch + (bucket * span_secs) / n;
+        let ts = DateTime::<Utc>::from_timestamp(ts_epoch, 0)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_default();
+        out.push(SeriesBucket {
+            ts,
+            avg_ms: if up_count > 0 { Some(sum_ms as f64 / up_count as f64) } else { None },
+            min_ms: row.try_get("min_ms").ok().flatten(),
+            max_ms: row.try_get("max_ms").ok().flatten(),
+            count: cnt,
+            up_ratio: if cnt > 0 { up_count as f64 / cnt as f64 } else { 0.0 },
+        });
+    }
+    Ok(out)
+}
+
+// ── Rollup maintenance ─────────────────────────────────────────────────────────
+
+/// Latest rolled-up minute (epoch), or None if the rollup is empty.
+pub async fn rollup_watermark(pool: &SqlitePool) -> Result<Option<i64>> {
+    let row = sqlx::query("SELECT MAX(bucket_epoch) AS m FROM probe_rollup_1m")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get::<Option<i64>, _>("m")?)
+}
+
+/// Earliest raw probe minute (epoch floored to the minute), or None if no data.
+pub async fn earliest_raw_minute(pool: &SqlitePool) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        "SELECT (CAST(strftime('%s', MIN(checked_at)) AS INTEGER) / 60) * 60 AS m FROM probe_results",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<Option<i64>, _>("m")?)
+}
+
+/// Aggregate raw results in `[from_epoch, to_epoch)` into per-minute rollup rows
+/// (INSERT OR REPLACE, idempotent). Returns rows affected.
+pub async fn roll_up_range(pool: &SqlitePool, from_epoch: i64, to_epoch: i64) -> Result<u64> {
+    let result = sqlx::query(
+        "INSERT OR REPLACE INTO probe_rollup_1m
+            (monitor_name, bucket_epoch, count, up_count, sum_ms, min_ms, max_ms)
+         SELECT monitor_name,
+                (CAST(strftime('%s', checked_at) AS INTEGER) / 60) * 60 AS b,
+                COUNT(*),
+                SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'up' THEN response_time_ms ELSE 0 END),
+                MIN(response_time_ms),
+                MAX(response_time_ms)
+         FROM probe_results
+         WHERE CAST(strftime('%s', checked_at) AS INTEGER) >= ?
+           AND CAST(strftime('%s', checked_at) AS INTEGER) < ?
+         GROUP BY monitor_name, b",
+    )
+    .bind(from_epoch)
+    .bind(to_epoch)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn prune_old_rollups(pool: &SqlitePool, retention_days: u64) -> Result<u64> {
+    let cutoff = (Utc::now() - chrono::Duration::days(retention_days as i64)).timestamp();
+    let result = sqlx::query("DELETE FROM probe_rollup_1m WHERE bucket_epoch < ?")
+        .bind(cutoff)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result<u64> {
     let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
     let cutoff_str = cutoff.to_rfc3339();
@@ -234,9 +376,14 @@ pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result
     Ok(result.rows_affected())
 }
 
-/// Delete all stored probe results for a monitor. Returns the number of rows removed.
+/// Delete all stored probe results (and rollups) for a monitor. Returns the
+/// number of raw rows removed.
 pub async fn delete_results(pool: &SqlitePool, monitor_name: &str) -> Result<u64> {
     let result = sqlx::query("DELETE FROM probe_results WHERE monitor_name = ?")
+        .bind(monitor_name)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM probe_rollup_1m WHERE monitor_name = ?")
         .bind(monitor_name)
         .execute(pool)
         .await?;

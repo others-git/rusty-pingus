@@ -142,7 +142,19 @@ The system SHALL expose `GET /api/monitors/:name/series` returning response-time
 - **THEN** an empty JSON array is returned with HTTP 200
 
 ### Requirement: Dynamic chart resolution
-The monitor detail response-time chart SHALL load data at a resolution matched to the visible time range. When the user zooms or pans, the chart SHALL refetch data for the currently visible range so that range is rendered at approximately the chart's point budget rather than the originally loaded window's resolution. When the visible range contains few enough probes to render individually, the chart SHALL display raw probe points; otherwise it SHALL display aggregated buckets. Refetches SHALL be debounced, and a loading indicator SHALL be shown while finer data loads. Resetting the zoom SHALL restore the active window and its resolution.
+The monitor detail response-time chart SHALL load data at a resolution matched to the visible time range. On load (and when an uptime window is selected) the chart SHALL fit its x-axis to the extent of the loaded data so the points fill the plot area rather than being compressed against an edge. When the user zooms or pans, the chart SHALL refetch data for the currently visible range so that range is rendered at approximately the chart's point budget rather than the originally loaded window's resolution. Panning SHALL move the view freely through time (it SHALL NOT be constrained to the initial window), and a zoom/pan-triggered refetch SHALL NOT reset the view position. When the visible range contains few enough probes to render individually, the chart SHALL display raw probe points; otherwise it SHALL display aggregated buckets. Refetches SHALL be debounced, and a loading indicator SHALL be shown while finer data loads. Resetting the zoom SHALL restore the active window and its resolution.
+
+#### Scenario: Data fills the chart on load
+- **WHEN** the monitor detail page loads (or a user selects an uptime window)
+- **THEN** the loaded data fills the plot area, fitted to the data's time extent, rather than being bunched against the left or right edge
+
+#### Scenario: Panning moves the view
+- **WHEN** a user drags to pan the chart
+- **THEN** the visible time range moves accordingly, and after the gesture settles data for the newly visible range is fetched and rendered
+
+#### Scenario: Gesture position preserved across refetch
+- **WHEN** a zoom or pan gesture triggers a refetch that changes the rendered resolution
+- **THEN** the view stays at the position the user left it (the refetch swaps data without snapping the view back)
 
 #### Scenario: Zooming in loads finer data
 - **WHEN** a user zooms into a sub-range of the chart
@@ -156,17 +168,73 @@ The monitor detail response-time chart SHALL load data at a resolution matched t
 - **WHEN** the visible range contains more probes than can be rendered individually
 - **THEN** the chart renders aggregated buckets (avg/min/max, up-ratio) for the visible range
 
-#### Scenario: Panning loads the newly visible range
-- **WHEN** a user pans the chart to a different time range
-- **THEN** after the gesture settles, data for the newly visible range is fetched and rendered
-
 #### Scenario: Refetches are debounced
 - **WHEN** a user performs rapid successive zoom or pan gestures
 - **THEN** intermediate refetches are coalesced so the server is not queried on every interaction, and only the final visible range is loaded
 
 #### Scenario: Reset restores the active window
 - **WHEN** a user activates the reset control after zooming or panning
-- **THEN** the chart returns to the active uptime window and reloads that window's resolution
+- **THEN** the chart returns to the active uptime window, re-fitted to that window's data
+
+### Requirement: Downtime visualization on the response chart
+The monitor detail response-time chart SHALL make downtime unmistakable: at points/intervals where the monitor is down (a raw probe with status `down`, or an aggregated interval with an up-ratio below 1), the response-time line SHALL be interrupted (a gap rather than a connecting segment), and the down span SHALL be shaded with a red vertical band over its time range.
+
+#### Scenario: Outage shown as a gap plus red band
+- **WHEN** the visible data contains a downtime span
+- **THEN** the line does not connect across the outage (it shows a gap), and a red vertical band is drawn spanning the outage's time range
+
+#### Scenario: No downtime
+- **WHEN** the visible data contains no down samples
+- **THEN** the line is continuous and no red bands are drawn
+
+#### Scenario: Downtime band on aggregated view
+- **WHEN** the chart is showing aggregated buckets and a bucket has loss (up-ratio below 1)
+- **THEN** that bucket's time span is shaded with a red band
+
+### Requirement: Downtime markers stay visible and are labeled
+Downtime on the monitor chart SHALL be marked in a way that remains visible at any zoom level (a fixed-size marker, not only a duration-proportional band). Brief drops and sustained outages SHALL be visually distinct: a brief drop is shown as a thin vertical marker, while a sustained outage (lasting beyond a short threshold) is shown as a filled band labeled with its start time and duration. Hovering a downtime marker SHALL reveal its time — a single timestamp for a brief drop, and the start→end range with duration for a sustained outage.
+
+#### Scenario: Brief drop stays visible when zoomed in
+- **WHEN** the user zooms in on a single dropped probe
+- **THEN** a thin vertical downtime marker remains visible at that time (it does not shrink to sub-pixel and disappear)
+
+#### Scenario: Sustained outage is fat and labeled
+- **WHEN** an outage lasts beyond the sustained threshold
+- **THEN** it is rendered as a filled red band labeled with its start time and duration
+
+#### Scenario: Hover reveals the outage time
+- **WHEN** the user hovers a downtime marker
+- **THEN** its timestamp is shown (a single time for a brief drop, or the start→end range and duration for a sustained outage)
+
+#### Scenario: Outage locatable when zoomed far out
+- **WHEN** the chart is zoomed out far enough that an outage's band would be sub-pixel
+- **THEN** a fixed-size marker still indicates the outage's location on the timeline
+
+### Requirement: Response chart pan and zoom
+The monitor detail response-time chart SHALL provide built-in pan and zoom: the user SHALL be able to zoom with the mouse wheel, pan by dragging within the plot, and adjust the visible range via a draggable range slider. Zooming and panning SHALL drive the dynamic-resolution refetch so the visible range is rendered at an appropriate resolution.
+
+#### Scenario: Wheel zoom
+- **WHEN** the user scrolls the wheel over the chart
+- **THEN** the chart zooms the time axis about the cursor, and after the gesture settles the visible range is refetched at the matching resolution
+
+#### Scenario: Drag to pan
+- **WHEN** the user drags within the plot area
+- **THEN** the visible time range moves with the drag, and the newly visible range is fetched and rendered
+
+#### Scenario: Range slider
+- **WHEN** the user drags the range slider beneath the chart
+- **THEN** the visible time range updates accordingly and the corresponding data is loaded
+
+### Requirement: Chart tooltip is robust at any hover position
+The monitor detail chart tooltip SHALL render without error at any hover position, including over outage gaps where there is no data point. It SHALL show the hovered time and the response time, or "no response" when there is no value at that point.
+
+#### Scenario: Hover over a data point
+- **WHEN** the user hovers over a point on the response-time line
+- **THEN** the tooltip shows that point's time and response time, with no console error
+
+#### Scenario: Hover over an outage gap
+- **WHEN** the user hovers over a time where the line is interrupted (an outage)
+- **THEN** the tooltip renders showing the time and "no response", without throwing
 
 ### Requirement: Dashboard auto-refresh
 The system SHALL poll the `/api/monitors` endpoint every 30 seconds using Alpine.js reactive state and update the dashboard display without a full page reload. A visual "last updated" timestamp SHALL be shown and updated on each successful poll.

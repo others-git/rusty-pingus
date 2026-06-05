@@ -185,6 +185,65 @@ async fn series_buckets_are_bounded_and_aggregated() {
     assert!(empty.is_empty(), "no results in range → empty series");
 }
 
+#[tokio::test]
+async fn rollups_back_series_and_uptime() {
+    let (pool, _dir) = open_temp_db().await;
+    let now = chrono::Utc::now();
+
+    // Seed 5 distinct minutes; each minute has 2 up (10ms, 20ms) + 1 down → per
+    // minute: count=3, up=2, up_ratio=2/3. Total: 15 probes, 10 up.
+    let minute_offsets = [80i64, 60, 40, 20, 5];
+    for off in minute_offsets {
+        let base = now - chrono::Duration::minutes(off);
+        for (i, rt) in [Some(10u64), Some(20u64), None].iter().enumerate() {
+            let r = probe::ProbeResult {
+                monitor_name: "roll".into(),
+                protocol: "tcp".into(),
+                endpoint: "h:1".into(),
+                status: if rt.is_some() { "up" } else { "down" }.into(),
+                response_time_ms: *rt,
+                failure_reason: if rt.is_some() { None } else { Some("timeout".into()) },
+                checked_at: base + chrono::Duration::seconds(i as i64), // same minute
+            };
+            db::insert_result(&pool, &r).await.expect("insert");
+        }
+    }
+
+    // Roll up the whole span.
+    let from = (now - chrono::Duration::minutes(90)).timestamp();
+    let to = now.timestamp() + 60;
+    db::roll_up_range(&pool, from, to).await.expect("roll_up_range");
+
+    assert!(db::rollup_watermark(&pool).await.expect("watermark").is_some());
+
+    // get_series over a wide span (span/buckets >= 60) → served from the rollup.
+    let series = db::get_series(
+        &pool,
+        "roll",
+        now - chrono::Duration::minutes(90),
+        now,
+        5,
+    )
+    .await
+    .expect("get_series");
+    let total: i64 = series.iter().map(|b| b.count).sum();
+    assert_eq!(total, 15, "rollup-backed series should count all 15 probes");
+    for b in &series {
+        assert!((b.up_ratio - 2.0 / 3.0).abs() < 1e-9, "up_ratio 2/3, got {}", b.up_ratio);
+        assert_eq!(b.avg_ms, Some(15.0), "avg of 10 and 20 = 15");
+        assert_eq!(b.min_ms, Some(10));
+        assert_eq!(b.max_ms, Some(20));
+    }
+
+    // get_uptime over a 30d window (>24h) → served from the rollup.
+    let uptime = db::get_uptime(&pool, "roll", 2_592_000).await.expect("uptime").unwrap();
+    assert!((uptime - (10.0 / 15.0) * 100.0).abs() < 0.01, "expected 66.67%, got {uptime}");
+
+    // delete_results also clears rollups.
+    db::delete_results(&pool, "roll").await.expect("delete");
+    assert!(db::rollup_watermark(&pool).await.expect("watermark").is_none());
+}
+
 #[test]
 fn missing_config_generates_default_and_returns_empty() {
     let dir = tempfile::tempdir().expect("tempdir");

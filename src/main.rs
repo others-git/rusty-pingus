@@ -155,6 +155,12 @@ async fn async_main(
         }))
     };
 
+    let rollup_handle = {
+        let pool = pool.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(scheduler::rollup_loop(pool, cancel))
+    };
+
     #[cfg(not(windows))]
     if is_first_launch {
         let url = dashboard_url.clone();
@@ -175,6 +181,7 @@ async fn async_main(
         let _ = sched_handle.await;
         let _ = web_handle.await;
         if let Some(h) = retention_handle { let _ = h.await; }
+        let _ = rollup_handle.await;
     });
     if drain.await.is_err() { tracing::warn!("Drain timeout exceeded"); }
 
