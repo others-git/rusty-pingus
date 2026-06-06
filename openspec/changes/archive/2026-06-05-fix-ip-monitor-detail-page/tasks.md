@@ -23,4 +23,4 @@
 - [ ] 4.3 Change the observed IP (or simulate a differing `detail`) and confirm the timeline updates to show the change.
 - [ ] 4.4 Confirm a response-time monitor's detail chart still renders and updates correctly (server-anchored), unaffected by the timeline-specific changes.
 - [ ] 4.5 Confirm the public-IP view shows no response-time metric, axis, or label.
-- [ ] 4.6 Sync the `web-ui` and `live-status-updates` main specs via this change's deltas at archive time.
+- [x] 4.6 Sync the `web-ui` and `live-status-updates` main specs via this change's deltas at archive time.
