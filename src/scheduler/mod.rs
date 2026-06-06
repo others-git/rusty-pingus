@@ -20,8 +20,12 @@ pub async fn run(
     // Track per-monitor cancel tokens so we can stop individual tasks.
     let mut task_tokens: HashMap<String, CancellationToken> = HashMap::new();
 
-    // Spawn initial tasks
+    // Spawn initial tasks (disabled monitors are not probed).
     for monitor in &initial_monitors {
+        if !monitor.enabled() {
+            info!(monitor = %monitor.name(), "Monitor disabled; not scheduling");
+            continue;
+        }
         let token = spawn_monitor(monitor.clone(), pool.clone(), cancel.clone(), updates.clone());
         task_tokens.insert(monitor.name().to_string(), token);
     }
@@ -52,28 +56,27 @@ fn diff_and_reload(
     global_cancel: &CancellationToken,
     updates: &broadcast::Sender<StatusUpdate>,
 ) {
-    let new_names: std::collections::HashSet<String> =
-        new_monitors.iter().map(|m| m.name().to_string()).collect();
-    // Collect old names up front to avoid borrow conflict
+    // `task_tokens` holds only *running* tasks; the desired set is the enabled
+    // monitors. Reconcile the two so this path also handles enable/disable
+    // toggles (not just add/remove): a monitor that became disabled has its task
+    // cancelled, and one that became enabled gets a task spawned.
     let old_names: Vec<String> = task_tokens.keys().cloned().collect();
 
-    // Cancel tasks for removed monitors
+    // Stop tasks for monitors that were removed entirely or are now disabled.
     for name in &old_names {
-        if !new_names.contains(name) {
+        let still_wanted = new_monitors.iter().any(|m| m.name() == name && m.enabled());
+        if !still_wanted {
             if let Some(token) = task_tokens.remove(name) {
-                info!(monitor = %name, "Stopping removed monitor");
+                info!(monitor = %name, "Stopping monitor (removed or disabled)");
                 token.cancel();
             }
         }
     }
 
-    let old_name_set: std::collections::HashSet<&str> =
-        old_names.iter().map(|s| s.as_str()).collect();
-
-    // Spawn tasks for added monitors
+    // Start tasks for enabled monitors that don't have one yet (added or enabled).
     for monitor in new_monitors {
-        if !old_name_set.contains(monitor.name()) {
-            info!(monitor = %monitor.name(), "Starting new monitor");
+        if monitor.enabled() && !task_tokens.contains_key(monitor.name()) {
+            info!(monitor = %monitor.name(), "Starting monitor");
             let token = spawn_monitor(monitor.clone(), pool.clone(), global_cancel.clone(), updates.clone());
             task_tokens.insert(monitor.name().to_string(), token);
         }

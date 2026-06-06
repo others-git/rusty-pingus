@@ -12,6 +12,8 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # Changes made via the UI are saved here automatically.
 
 # Timing fields are in milliseconds: interval_ms and timeout_ms.
+# Any monitor may set `enabled = false` to pause it (kept in config + history,
+# but not probed). Omit the key for the default (enabled).
 
 # HTTP monitor example:
 # [[monitors]]
@@ -137,6 +139,31 @@ impl MonitorConfig {
             Self::Traceroute(c) => c.host.clone(),
         }
     }
+
+    /// Whether this monitor should be probed. Disabled monitors are retained in
+    /// config (and keep their history) but the scheduler runs no task for them.
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Http(c) => c.enabled,
+            Self::Tcp(c) => c.enabled,
+            Self::Icmp(c) => c.enabled,
+            Self::PublicIp(c) => c.enabled,
+            Self::Border(c) => c.enabled,
+            Self::Traceroute(c) => c.enabled,
+        }
+    }
+
+    /// Set the enabled flag on this monitor (any variant).
+    fn set_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::Http(c) => c.enabled = enabled,
+            Self::Tcp(c) => c.enabled = enabled,
+            Self::Icmp(c) => c.enabled = enabled,
+            Self::PublicIp(c) => c.enabled = enabled,
+            Self::Border(c) => c.enabled = enabled,
+            Self::Traceroute(c) => c.enabled = enabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +180,8 @@ pub struct HttpMonitorConfig {
     pub headers: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +192,8 @@ pub struct TcpMonitorConfig {
     pub port: u16,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +206,8 @@ pub struct IcmpMonitorConfig {
     /// Number of ICMP echo requests sent per probe cycle. The monitor is up if
     /// at least one reply is received; defaults to 3, clamped to a minimum of 1.
     pub count: u32,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +220,8 @@ pub struct PublicIpMonitorConfig {
     pub url: Option<String>,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +235,8 @@ pub struct BorderMonitorConfig {
     pub upstream: String,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,10 +255,15 @@ pub struct TracerouteMonitorConfig {
     /// How long to retain this monitor's traceroute runs before pruning, in
     /// milliseconds. Replaces the fixed rollup windows for this monitor type.
     pub retention_ms: u64,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
 }
 
 pub fn default_interval_ms() -> u64 { 60_000 }
 pub fn default_timeout_ms() -> u64 { 10_000 }
+/// Monitors default to enabled; the key is omitted from the config when true.
+fn default_true() -> bool { true }
+fn is_true(b: &bool) -> bool { *b }
 fn default_traceroute_max_hops() -> u32 { 30 }
 fn default_traceroute_queries() -> u32 { 3 }
 /// Default traceroute retention: 24 hours.
@@ -239,6 +281,25 @@ fn resolve_ms(ms: Option<u64>, secs: Option<u64>, default: u64) -> u64 {
     ms.or_else(|| secs.map(|s| s.saturating_mul(1000))).unwrap_or(default)
 }
 
+/// Resolve the standard interval/timeout pair (with legacy `*_secs` fallback)
+/// shared by every monitor type's deserialization.
+fn resolve_timing(
+    interval_ms: Option<u64>, interval_secs: Option<u64>,
+    timeout_ms: Option<u64>, timeout_secs: Option<u64>,
+) -> (u64, u64) {
+    (
+        resolve_ms(interval_ms, interval_secs, default_interval_ms()),
+        resolve_ms(timeout_ms, timeout_secs, default_timeout_ms()),
+    )
+}
+
+/// Apply global `[defaults]` to a monitor's interval/timeout: a per-monitor value
+/// still at the built-in default is overridden by the configured default.
+fn apply_timing_defaults(interval_ms: &mut u64, timeout_ms: &mut u64, defaults: &Defaults) {
+    if let Some(t) = defaults.timeout_ms { if *timeout_ms == default_timeout_ms() { *timeout_ms = t; } }
+    if let Some(i) = defaults.interval_ms { if *interval_ms == default_interval_ms() { *interval_ms = i; } }
+}
+
 #[derive(Deserialize)]
 struct RawHttpMonitorConfig {
     name: String,
@@ -251,19 +312,22 @@ struct RawHttpMonitorConfig {
     #[serde(default)] expected_status: Option<u16>,
     #[serde(default)] headers: HashMap<String, String>,
     #[serde(default)] body: Option<String>,
+    #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawHttpMonitorConfig> for HttpMonitorConfig {
     fn from(r: RawHttpMonitorConfig) -> Self {
+        let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
         Self {
             name: r.name,
             url: r.url,
-            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
-            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            interval_ms,
+            timeout_ms,
             method: r.method,
             expected_status: r.expected_status,
             headers: r.headers,
             body: r.body,
+            enabled: r.enabled,
         }
     }
 }
@@ -277,17 +341,13 @@ struct RawTcpMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawTcpMonitorConfig> for TcpMonitorConfig {
     fn from(r: RawTcpMonitorConfig) -> Self {
-        Self {
-            name: r.name,
-            host: r.host,
-            port: r.port,
-            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
-            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
-        }
+        let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
+        Self { name: r.name, host: r.host, port: r.port, interval_ms, timeout_ms, enabled: r.enabled }
     }
 }
 
@@ -300,15 +360,18 @@ struct RawIcmpMonitorConfig {
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
     #[serde(default)] count: Option<u32>,
+    #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawIcmpMonitorConfig> for IcmpMonitorConfig {
     fn from(r: RawIcmpMonitorConfig) -> Self {
+        let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
         Self {
+            enabled: r.enabled,
             name: r.name,
             host: r.host,
-            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
-            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            interval_ms,
+            timeout_ms,
             count: r.count.unwrap_or_else(default_icmp_count).max(1),
         }
     }
@@ -322,16 +385,19 @@ struct RawPublicIpMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawPublicIpMonitorConfig> for PublicIpMonitorConfig {
     fn from(r: RawPublicIpMonitorConfig) -> Self {
+        let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
         Self {
             name: r.name,
             // Treat an empty URL as unset so the default/fallback applies.
             url: r.url.filter(|u| !u.trim().is_empty()),
-            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
-            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            interval_ms,
+            timeout_ms,
+            enabled: r.enabled,
         }
     }
 }
@@ -345,10 +411,12 @@ struct RawBorderMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawBorderMonitorConfig> for BorderMonitorConfig {
     fn from(r: RawBorderMonitorConfig) -> Self {
+        let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
         Self {
             name: r.name,
             gateway: r.gateway.filter(|g| !g.trim().is_empty()),
@@ -356,8 +424,9 @@ impl From<RawBorderMonitorConfig> for BorderMonitorConfig {
                 .upstream
                 .filter(|u| !u.trim().is_empty())
                 .unwrap_or_else(default_border_upstream),
-            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
-            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            interval_ms,
+            timeout_ms,
+            enabled: r.enabled,
         }
     }
 }
@@ -374,20 +443,22 @@ struct RawTracerouteMonitorConfig {
     #[serde(default)] queries_per_hop: Option<u32>,
     #[serde(default)] retention_ms: Option<u64>,
     #[serde(default)] retention_secs: Option<u64>,
+    #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawTracerouteMonitorConfig> for TracerouteMonitorConfig {
     fn from(r: RawTracerouteMonitorConfig) -> Self {
+        let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
         Self {
             name: r.name,
             host: r.host,
             // Enforce the 500 ms interval floor uniformly across config + UI paths.
-            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms())
-                .max(TRACEROUTE_MIN_INTERVAL_MS),
-            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            interval_ms: interval_ms.max(TRACEROUTE_MIN_INTERVAL_MS),
+            timeout_ms,
             max_hops: r.max_hops.unwrap_or_else(default_traceroute_max_hops).clamp(1, 64),
             queries_per_hop: r.queries_per_hop.unwrap_or_else(default_traceroute_queries).max(1),
             retention_ms: resolve_ms(r.retention_ms, r.retention_secs, default_traceroute_retention_ms()),
+            enabled: r.enabled,
         }
     }
 }
@@ -453,6 +524,21 @@ impl MonitorStore {
         Ok(())
     }
 
+    /// Set a monitor's enabled flag, persisting and notifying watchers (the
+    /// scheduler reacts via hot-reload). Returns `false` if no such monitor.
+    pub async fn set_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
+        let mut monitors = self.inner.write().await;
+        let Some(m) = monitors.iter_mut().find(|m| m.name() == name) else {
+            return Ok(false);
+        };
+        if m.enabled() == enabled {
+            return Ok(true); // no-op; avoid a needless rewrite/notify
+        }
+        m.set_enabled(enabled);
+        self.persist_and_notify(&monitors)?;
+        Ok(true)
+    }
+
     /// Returns `true` if found and removed, `false` if not found.
     pub async fn remove(&self, name: &str) -> Result<bool> {
         let mut monitors = self.inner.write().await;
@@ -515,33 +601,15 @@ fn save_to_path(path: &Path, monitors: &[MonitorConfig]) -> Result<()> {
 }
 
 pub fn apply_defaults(monitors: &mut Vec<MonitorConfig>, defaults: &Defaults) {
-    let timeout = defaults.timeout_ms;
-    let interval = defaults.interval_ms;
     for monitor in monitors {
         match monitor {
-            MonitorConfig::Http(c) => {
-                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
-                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
-            }
-            MonitorConfig::Tcp(c) => {
-                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
-                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
-            }
-            MonitorConfig::Icmp(c) => {
-                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
-                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
-            }
-            MonitorConfig::PublicIp(c) => {
-                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
-                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
-            }
-            MonitorConfig::Border(c) => {
-                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
-                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
-            }
+            MonitorConfig::Http(c) => apply_timing_defaults(&mut c.interval_ms, &mut c.timeout_ms, defaults),
+            MonitorConfig::Tcp(c) => apply_timing_defaults(&mut c.interval_ms, &mut c.timeout_ms, defaults),
+            MonitorConfig::Icmp(c) => apply_timing_defaults(&mut c.interval_ms, &mut c.timeout_ms, defaults),
+            MonitorConfig::PublicIp(c) => apply_timing_defaults(&mut c.interval_ms, &mut c.timeout_ms, defaults),
+            MonitorConfig::Border(c) => apply_timing_defaults(&mut c.interval_ms, &mut c.timeout_ms, defaults),
             MonitorConfig::Traceroute(c) => {
-                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
-                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
+                apply_timing_defaults(&mut c.interval_ms, &mut c.timeout_ms, defaults);
                 // Re-apply the floor in case a global default lowered the interval.
                 c.interval_ms = c.interval_ms.max(TRACEROUTE_MIN_INTERVAL_MS);
             }
@@ -676,6 +744,40 @@ mod tests {
         assert_eq!(c.max_hops, 30);
         assert_eq!(c.queries_per_hop, 3);
         assert_eq!(c.retention_ms, 86_400_000);
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_when_missing() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\n",
+        );
+        assert!(c.enabled);
+    }
+
+    #[test]
+    fn enabled_false_round_trips() {
+        let toml_in = "[[monitors]]\nprotocol = \"http\"\nname = \"s\"\nurl = \"https://x\"\nenabled = false\n";
+        let file: MonitorsFile = toml::from_str(toml_in).expect("valid TOML");
+        match &file.monitors[0] {
+            MonitorConfig::Http(c) => assert!(!c.enabled),
+            other => panic!("expected http, got {other:?}"),
+        }
+        // Serializing a disabled monitor must keep the key; an enabled one omits it.
+        let out = toml::to_string(&file).unwrap();
+        assert!(out.contains("enabled = false"), "disabled flag must persist: {out}");
+    }
+
+    #[test]
+    fn enabled_true_is_omitted_on_serialize() {
+        let file = MonitorsFile {
+            monitors: vec![MonitorConfig::Http(HttpMonitorConfig {
+                name: "s".into(), url: "https://x".into(), interval_ms: 1000, timeout_ms: 1000,
+                method: "GET".into(), expected_status: None, headers: HashMap::new(), body: None,
+                enabled: true,
+            })],
+        };
+        let out = toml::to_string(&file).unwrap();
+        assert!(!out.contains("enabled"), "enabled=true should be omitted: {out}");
     }
 
     #[test]

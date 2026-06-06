@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
 use crate::probe::ProbeResult;
@@ -28,30 +28,50 @@ pub async fn init(path: &str) -> Result<SqlitePool> {
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
+    // Reclaim space left by a destructive migration (e.g. dropped columns). VACUUM
+    // can't run inside a migration's transaction, so do it here, once, and only
+    // when there's meaningful slack (cheap to check; no-op on a tight DB).
+    let freelist: i64 = sqlx::query_scalar("PRAGMA freelist_count").fetch_one(&pool).await.unwrap_or(0);
+    if freelist > 1000 {
+        if let Err(e) = sqlx::query("VACUUM").execute(&pool).await {
+            tracing::warn!(error = %e, "VACUUM after migration failed (space not reclaimed)");
+        } else {
+            tracing::info!(reclaimed_pages = freelist, "Compacted database (VACUUM)");
+        }
+    }
+
     Ok(pool)
 }
 
+/// Format a stored epoch-millisecond timestamp as the RFC3339 string the API has
+/// always returned, so the on-disk integer encoding is invisible to clients.
+fn epoch_ms_to_rfc3339(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
+}
+
 pub async fn insert_result(pool: &SqlitePool, result: &ProbeResult) -> Result<()> {
+    // protocol/endpoint are constant per monitor and supplied from config at the
+    // API layer, so they are no longer duplicated on every row. checked_at is an
+    // integer epoch (ms).
     sqlx::query(
-        "INSERT INTO probe_results (monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO probe_results (monitor_name, status, response_time_ms, failure_reason, detail, checked_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&result.monitor_name)
-    .bind(&result.protocol)
-    .bind(&result.endpoint)
     .bind(&result.status)
     .bind(result.response_time_ms.map(|v| v as i64))
     .bind(&result.failure_reason)
     .bind(&result.detail)
-    .bind(result.checked_at.to_rfc3339())
+    .bind(result.checked_at.timestamp_millis())
     .execute(pool)
     .await?;
     Ok(())
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 pub struct CurrentStatus {
     pub monitor_name: String,
+    /// Supplied by the API layer from the monitor config (not stored per row).
     pub protocol: String,
     pub endpoint: String,
     pub status: String,
@@ -61,11 +81,24 @@ pub struct CurrentStatus {
     pub checked_at: String,
 }
 
+fn row_to_current(row: &sqlx::sqlite::SqliteRow) -> Result<CurrentStatus> {
+    Ok(CurrentStatus {
+        monitor_name: row.try_get("monitor_name")?,
+        protocol: String::new(), // filled from config by the API layer
+        endpoint: String::new(),
+        status: row.try_get("status")?,
+        response_time_ms: row.try_get("response_time_ms")?,
+        failure_reason: row.try_get("failure_reason")?,
+        detail: row.try_get("detail")?,
+        checked_at: epoch_ms_to_rfc3339(row.try_get("checked_at")?),
+    })
+}
+
 /// Latest probe result for a single monitor. O(1) index seek — used by the
 /// dashboard so its cost scales with the number of monitors, not total rows.
 pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<Option<CurrentStatus>> {
-    let row = sqlx::query_as::<_, CurrentStatus>(
-        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at
+    let row = sqlx::query(
+        "SELECT monitor_name, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
          WHERE monitor_name = ?
          ORDER BY checked_at DESC
@@ -74,25 +107,26 @@ pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<
     .bind(monitor_name)
     .fetch_optional(pool)
     .await?;
-    Ok(row)
+    row.as_ref().map(row_to_current).transpose()
 }
 
 pub async fn get_current_status(pool: &SqlitePool) -> Result<Vec<CurrentStatus>> {
-    let rows = sqlx::query_as::<_, CurrentStatus>(
-        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at
+    let rows = sqlx::query(
+        "SELECT monitor_name, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
          WHERE id IN (SELECT MAX(id) FROM probe_results GROUP BY monitor_name)
          ORDER BY monitor_name",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    rows.iter().map(row_to_current).collect()
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 pub struct HistoryRow {
     pub id: i64,
     pub monitor_name: String,
+    /// Supplied by the API layer from the monitor config (not stored per row).
     pub protocol: String,
     pub endpoint: String,
     pub status: String,
@@ -109,27 +143,35 @@ pub async fn get_history(
     to: Option<DateTime<Utc>>,
     limit: i64,
 ) -> Result<Vec<HistoryRow>> {
-    let from_str = from
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-    let to_str = to
-        .map(|d| d.to_rfc3339())
-        .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string());
+    let from_ms = from.map(|d| d.timestamp_millis()).unwrap_or(i64::MIN);
+    let to_ms = to.map(|d| d.timestamp_millis()).unwrap_or(i64::MAX);
 
-    let rows = sqlx::query_as::<_, HistoryRow>(
-        "SELECT id, monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at
+    let rows = sqlx::query(
+        "SELECT id, monitor_name, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
          WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
          ORDER BY checked_at DESC
          LIMIT ?",
     )
     .bind(monitor_name)
-    .bind(&from_str)
-    .bind(&to_str)
+    .bind(from_ms)
+    .bind(to_ms)
     .bind(limit)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    rows.iter().map(|row| {
+        Ok(HistoryRow {
+            id: row.try_get("id")?,
+            monitor_name: row.try_get("monitor_name")?,
+            protocol: String::new(),
+            endpoint: String::new(),
+            status: row.try_get("status")?,
+            response_time_ms: row.try_get("response_time_ms")?,
+            failure_reason: row.try_get("failure_reason")?,
+            detail: row.try_get("detail")?,
+            checked_at: epoch_ms_to_rfc3339(row.try_get("checked_at")?),
+        })
+    }).collect()
 }
 
 pub async fn get_uptime(
@@ -158,8 +200,7 @@ pub async fn get_uptime(
         }
     }
 
-    let from = Utc::now() - chrono::Duration::seconds(window_secs);
-    let from_str = from.to_rfc3339();
+    let from_ms = (Utc::now() - chrono::Duration::seconds(window_secs)).timestamp_millis();
 
     let row = sqlx::query(
         "SELECT COUNT(*) as total, SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) as up_count
@@ -167,7 +208,7 @@ pub async fn get_uptime(
          WHERE monitor_name = ? AND checked_at >= ?",
     )
     .bind(monitor_name)
-    .bind(&from_str)
+    .bind(from_ms)
     .fetch_one(pool)
     .await?;
 
@@ -177,6 +218,32 @@ pub async fn get_uptime(
     }
     let up: i64 = row.try_get("up_count").unwrap_or(0);
     Ok(Some((up as f64 / total as f64) * 100.0))
+}
+
+/// 24h uptime % for every monitor in one query (for the dashboard list, so it
+/// doesn't fan out a per-monitor uptime query). Keyed by monitor name; monitors
+/// with no probes in the window are absent.
+pub async fn get_uptime_24h_all(pool: &SqlitePool) -> Result<std::collections::HashMap<String, f64>> {
+    let from_ms = (Utc::now() - chrono::Duration::hours(24)).timestamp_millis();
+    let rows = sqlx::query(
+        "SELECT monitor_name,
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) AS up_count
+         FROM probe_results WHERE checked_at >= ? GROUP BY monitor_name",
+    )
+    .bind(from_ms)
+    .fetch_all(pool)
+    .await?;
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let total: i64 = row.try_get("total").unwrap_or(0);
+        if total > 0 {
+            let up: i64 = row.try_get("up_count").unwrap_or(0);
+            let name: String = row.try_get("monitor_name")?;
+            map.insert(name, (up as f64 / total as f64) * 100.0);
+        }
+    }
+    Ok(map)
 }
 
 #[derive(Debug, Serialize)]
@@ -217,11 +284,13 @@ pub async fn get_series(
         }
     }
 
-    let from_str = from.to_rfc3339();
-    let to_str = to.to_rfc3339();
+    // checked_at is epoch ms; bucket on the millisecond span (no per-row parsing).
+    let from_ms = from.timestamp_millis();
+    let to_ms = to.timestamp_millis();
+    let span_ms = (to_ms - from_ms).max(1);
 
     let rows = sqlx::query(
-        "SELECT MIN(? - 1, (CAST(strftime('%s', checked_at) AS INTEGER) - ?) * ? / ?) AS bucket,
+        "SELECT MIN(? - 1, (checked_at - ?) * ? / ?) AS bucket,
                 AVG(response_time_ms) AS avg_ms,
                 MIN(response_time_ms) AS min_ms,
                 MAX(response_time_ms) AS max_ms,
@@ -233,12 +302,12 @@ pub async fn get_series(
          ORDER BY bucket",
     )
     .bind(n)
-    .bind(from_epoch)
+    .bind(from_ms)
     .bind(n)
-    .bind(span_secs)
+    .bind(span_ms)
     .bind(monitor_name)
-    .bind(&from_str)
-    .bind(&to_str)
+    .bind(from_ms)
+    .bind(to_ms)
     .fetch_all(pool)
     .await?;
 
@@ -327,8 +396,9 @@ pub async fn rollup_watermark(pool: &SqlitePool) -> Result<Option<i64>> {
 
 /// Earliest raw probe minute (epoch floored to the minute), or None if no data.
 pub async fn earliest_raw_minute(pool: &SqlitePool) -> Result<Option<i64>> {
+    // checked_at is epoch ms; floor to the minute in epoch seconds.
     let row = sqlx::query(
-        "SELECT (CAST(strftime('%s', MIN(checked_at)) AS INTEGER) / 60) * 60 AS m FROM probe_results",
+        "SELECT (MIN(checked_at) / 60000) * 60 AS m FROM probe_results",
     )
     .fetch_one(pool)
     .await?;
@@ -342,19 +412,18 @@ pub async fn roll_up_range(pool: &SqlitePool, from_epoch: i64, to_epoch: i64) ->
         "INSERT OR REPLACE INTO probe_rollup_1m
             (monitor_name, bucket_epoch, count, up_count, sum_ms, min_ms, max_ms)
          SELECT monitor_name,
-                (CAST(strftime('%s', checked_at) AS INTEGER) / 60) * 60 AS b,
+                (checked_at / 60000) * 60 AS b,
                 COUNT(*),
                 SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status = 'up' THEN response_time_ms ELSE 0 END),
                 MIN(response_time_ms),
                 MAX(response_time_ms)
          FROM probe_results
-         WHERE CAST(strftime('%s', checked_at) AS INTEGER) >= ?
-           AND CAST(strftime('%s', checked_at) AS INTEGER) < ?
+         WHERE checked_at >= ? AND checked_at < ?
          GROUP BY monitor_name, b",
     )
-    .bind(from_epoch)
-    .bind(to_epoch)
+    .bind(from_epoch * 1000)
+    .bind(to_epoch * 1000)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -370,10 +439,9 @@ pub async fn prune_old_rollups(pool: &SqlitePool, retention_days: u64) -> Result
 }
 
 pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result<u64> {
-    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
-    let cutoff_str = cutoff.to_rfc3339();
+    let cutoff_ms = (Utc::now() - chrono::Duration::days(retention_days as i64)).timestamp_millis();
     let result = sqlx::query("DELETE FROM probe_results WHERE checked_at < ?")
-        .bind(&cutoff_str)
+        .bind(cutoff_ms)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
@@ -419,7 +487,8 @@ pub struct TraceRunInput {
 
 /// Persist one traceroute run: insert the run, intern each hop address (so a
 /// stable route stores each address once), and write the hop rows — all in one
-/// transaction. `rtt_us` mirrors `avg_us` as the hop's representative latency.
+/// transaction. Addresses are cached within the run so a repeated hop address is
+/// interned with a single lookup.
 pub async fn insert_traceroute(
     pool: &SqlitePool,
     monitor_name: &str,
@@ -433,39 +502,44 @@ pub async fn insert_traceroute(
          VALUES (?, ?, ?, ?) RETURNING id",
     )
     .bind(monitor_name)
-    .bind(checked_at.to_rfc3339())
+    .bind(checked_at.timestamp_millis())
     .bind(if run.reached { 1 } else { 0 })
     .bind(run.hops.len() as i64)
     .fetch_one(&mut *tx)
     .await?
     .try_get("id")?;
 
+    // Intern addresses once per distinct value within this run.
+    let mut addr_cache: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     for hop in &run.hops {
         let addr_id: Option<i64> = match &hop.addr {
             Some(addr) => {
-                // Intern: insert if new, then read back the id (upsert keeps it unique).
-                sqlx::query("INSERT INTO traceroute_addrs (addr) VALUES (?) ON CONFLICT(addr) DO NOTHING")
-                    .bind(addr)
-                    .execute(&mut *tx)
-                    .await?;
-                let id: i64 = sqlx::query("SELECT id FROM traceroute_addrs WHERE addr = ?")
-                    .bind(addr)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get("id")?;
-                Some(id)
+                if let Some(&id) = addr_cache.get(addr.as_str()) {
+                    Some(id)
+                } else {
+                    sqlx::query("INSERT INTO traceroute_addrs (addr) VALUES (?) ON CONFLICT(addr) DO NOTHING")
+                        .bind(addr)
+                        .execute(&mut *tx)
+                        .await?;
+                    let id: i64 = sqlx::query("SELECT id FROM traceroute_addrs WHERE addr = ?")
+                        .bind(addr)
+                        .fetch_one(&mut *tx)
+                        .await?
+                        .try_get("id")?;
+                    addr_cache.insert(addr.as_str(), id);
+                    Some(id)
+                }
             }
             None => None,
         };
 
         sqlx::query(
-            "INSERT INTO traceroute_hops (run_id, hop_no, addr_id, rtt_us, min_us, avg_us, max_us, loss)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO traceroute_hops (run_id, hop_no, addr_id, min_us, avg_us, max_us, loss)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(hop.hop_no)
         .bind(addr_id)
-        .bind(hop.avg_us)
         .bind(hop.min_us)
         .bind(hop.avg_us)
         .bind(hop.max_us)
@@ -501,8 +575,8 @@ pub async fn get_traceroute_hops(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<Vec<TraceHopAgg>> {
-    let from_str = from.to_rfc3339();
-    let to_str = to.to_rfc3339();
+    let from_ms = from.timestamp_millis();
+    let to_ms = to.timestamp_millis();
 
     // Aggregates per hop position across all runs in range (RTTs in microseconds).
     let rows = sqlx::query(
@@ -522,8 +596,8 @@ pub async fn get_traceroute_hops(
          ORDER BY h.hop_no",
     )
     .bind(monitor_name)
-    .bind(&from_str)
-    .bind(&to_str)
+    .bind(from_ms)
+    .bind(to_ms)
     .fetch_all(pool)
     .await?;
 
@@ -533,8 +607,8 @@ pub async fn get_traceroute_hops(
          WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?",
     )
     .bind(monitor_name)
-    .bind(&from_str)
-    .bind(&to_str)
+    .bind(from_ms)
+    .bind(to_ms)
     .fetch_one(pool)
     .await?
     .try_get::<Option<i64>, _>("id")?;
@@ -589,10 +663,10 @@ pub async fn get_traceroute_extent(
     .bind(monitor_name)
     .fetch_one(pool)
     .await?;
-    let lo: Option<String> = row.try_get("lo")?;
-    let hi: Option<String> = row.try_get("hi")?;
+    let lo: Option<i64> = row.try_get("lo")?;
+    let hi: Option<i64> = row.try_get("hi")?;
     Ok(match (lo, hi) {
-        (Some(lo), Some(hi)) => Some((lo, hi)),
+        (Some(lo), Some(hi)) => Some((epoch_ms_to_rfc3339(lo), epoch_ms_to_rfc3339(hi))),
         _ => None,
     })
 }
@@ -606,7 +680,7 @@ pub async fn prune_traceroute(
     monitor_name: &str,
     retention_ms: u64,
 ) -> Result<u64> {
-    let cutoff = (Utc::now() - chrono::Duration::milliseconds(retention_ms as i64)).to_rfc3339();
+    let cutoff_ms = (Utc::now() - chrono::Duration::milliseconds(retention_ms as i64)).timestamp_millis();
     let mut tx = pool.begin().await?;
 
     sqlx::query(
@@ -614,7 +688,7 @@ pub async fn prune_traceroute(
             (SELECT id FROM traceroute_runs WHERE monitor_name = ? AND checked_at < ?)",
     )
     .bind(monitor_name)
-    .bind(&cutoff)
+    .bind(cutoff_ms)
     .execute(&mut *tx)
     .await?;
 
@@ -622,7 +696,7 @@ pub async fn prune_traceroute(
         "DELETE FROM traceroute_runs WHERE monitor_name = ? AND checked_at < ?",
     )
     .bind(monitor_name)
-    .bind(&cutoff)
+    .bind(cutoff_ms)
     .execute(&mut *tx)
     .await?
     .rows_affected();

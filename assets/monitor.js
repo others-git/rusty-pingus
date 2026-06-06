@@ -120,23 +120,15 @@ function monitorDetail() {
     // reloaded on a debounce so a just-started monitor's data fills in without a
     // manual reload. A poll covers any window where the stream is unavailable.
     connectLive() {
-      if (!('EventSource' in window)) { this._startPoll(); return; }
-      try {
-        eventSource = new EventSource('/api/monitors/stream');
-      } catch (e) {
-        console.warn('SSE unavailable, relying on poll', e);
-        this._startPoll();
-        return;
-      }
-      eventSource.onopen = () => this._stopPoll(); // stream live → poll not needed
-      eventSource.onmessage = (ev) => {
-        let u;
-        try { u = JSON.parse(ev.data); } catch (e) { return; }
-        if (u.name !== this.monitorName) return; // ignore other monitors
-        this._onLiveUpdate(u);
-      };
-      // Browser auto-reconnects on error; the poll covers the gap meanwhile.
-      eventSource.onerror = () => this._startPoll();
+      eventSource = window.RP.subscribeStatus({
+        onOpen: () => this._stopPoll(),            // stream live → poll not needed
+        onError: () => this._startPoll(),          // browser reconnects; poll covers the gap
+        onUpdate: (u) => {
+          if (u.name !== this.monitorName) return; // ignore other monitors
+          this._onLiveUpdate(u);
+        },
+      });
+      if (!eventSource) this._startPoll();          // no SSE support → poll-only
     },
 
     // Update the header/strip fields directly from a status payload.
@@ -785,12 +777,7 @@ function monitorDetail() {
       return fmtDuration(ms);
     },
     formatRelative(iso) {
-      const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-      if (diff < 10) return 'just now';
-      if (diff < 60) return `${diff}s ago`;
-      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-      return `${Math.floor(diff / 86400)}d ago`;
+      return window.RP.formatRelative(iso);
     },
   };
 }

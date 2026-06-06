@@ -75,6 +75,16 @@ pub async fn monitor_stream(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// A monitor's protocol + endpoint from the current config, or neutral fallbacks
+/// when it is no longer configured (e.g. history for a since-deleted monitor).
+/// These are no longer stored per probe row, so responses source them here.
+async fn monitor_identity(state: &AppState, name: &str) -> (String, String) {
+    state.monitors.list().await.iter()
+        .find(|m| m.name() == name)
+        .map(|m| (m.protocol().to_string(), m.endpoint()))
+        .unwrap_or_else(|| ("unknown".to_string(), String::new()))
+}
+
 // ── Existing read-only endpoints ──────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -88,6 +98,7 @@ pub struct MonitorStatus {
     pub failure_reason: Option<String>,
     pub detail: Option<String>,
     pub uptime_24h: Option<f64>,
+    pub enabled: bool,
 }
 
 pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
@@ -96,37 +107,48 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
     // history for unconfigured monitors and scales with the monitor count, not the
     // total row count. Configured-but-unprobed monitors show as pending.
     let configured = state.monitors.list().await;
+    // Batched: one query for every monitor's latest status, one for 24h uptime —
+    // instead of two queries per monitor. protocol/endpoint come from the config
+    // (no longer stored per probe row).
+    let latest: std::collections::HashMap<String, db::CurrentStatus> = db::get_current_status(&state.pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.monitor_name.clone(), s))
+        .collect();
+    let uptime = db::get_uptime_24h_all(&state.pool).await.unwrap_or_default();
+
     let mut result = Vec::with_capacity(configured.len());
     for m in &configured {
         let name = m.name().to_string();
-        match db::get_latest_status(&state.pool, &name).await {
-            Ok(Some(s)) => {
-                let uptime_24h = db::get_uptime(&state.pool, &name, 86_400).await.ok().flatten();
-                result.push(MonitorStatus {
-                    name,
-                    protocol: s.protocol,
-                    endpoint: s.endpoint,
-                    status: s.status,
-                    last_checked_at: Some(s.checked_at),
-                    response_time_ms: s.response_time_ms,
-                    failure_reason: s.failure_reason,
-                    detail: s.detail,
-                    uptime_24h,
-                });
-            }
-            _ => {
-                result.push(MonitorStatus {
-                    name,
-                    protocol: m.protocol().to_string(),
-                    endpoint: m.endpoint(),
-                    status: "pending".to_string(),
-                    last_checked_at: None,
-                    response_time_ms: None,
-                    failure_reason: None,
-                    detail: None,
-                    uptime_24h: None,
-                });
-            }
+        let protocol = m.protocol().to_string();
+        let endpoint = m.endpoint();
+        let enabled = m.enabled();
+        match latest.get(&name) {
+            Some(s) => result.push(MonitorStatus {
+                uptime_24h: uptime.get(&name).copied(),
+                protocol,
+                endpoint,
+                enabled,
+                status: s.status.clone(),
+                last_checked_at: Some(s.checked_at.clone()),
+                response_time_ms: s.response_time_ms,
+                failure_reason: s.failure_reason.clone(),
+                detail: s.detail.clone(),
+                name,
+            }),
+            None => result.push(MonitorStatus {
+                name,
+                protocol,
+                endpoint,
+                enabled,
+                status: "pending".to_string(),
+                last_checked_at: None,
+                response_time_ms: None,
+                failure_reason: None,
+                detail: None,
+                uptime_24h: None,
+            }),
         }
     }
     Json(result).into_response()
@@ -153,7 +175,13 @@ pub async fn monitor_history(
     }
     let limit = params.limit.unwrap_or(100).min(1000);
     match db::get_history(&state.pool, &name, params.from, params.to, limit).await {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(mut rows) => {
+            // protocol/endpoint are not stored per row; supply them from config
+            // (the detail page relies on `protocol` to choose its view).
+            let (protocol, endpoint) = monitor_identity(&state, &name).await;
+            for r in &mut rows { r.protocol = protocol.clone(); r.endpoint = endpoint.clone(); }
+            Json(rows).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "DB error in monitor_history");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
@@ -287,6 +315,31 @@ pub async fn add_monitor(
     }
 }
 
+#[derive(Deserialize)]
+pub struct EnabledBody {
+    pub enabled: bool,
+}
+
+/// `POST /api/monitors/:name/enabled` — enable or disable a monitor without
+/// deleting it. Persists + notifies (the scheduler reacts via hot-reload).
+pub async fn set_monitor_enabled(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<EnabledBody>,
+) -> impl IntoResponse {
+    match state.monitors.set_enabled(&name, body.enabled).await {
+        Ok(true) => Json(state.monitors.list().await).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor not found" })),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ).into_response(),
+    }
+}
+
 pub async fn delete_monitor(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -332,27 +385,23 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
         MonitorConfig::Http(c) => {
             if c.url.is_empty() {
                 errors.push("url is required".into());
-            } else if !c.url.starts_with("http://") && !c.url.starts_with("https://") {
+            } else if !is_http_url(&c.url) {
                 errors.push("url must be a valid http or https URL".into());
             }
         }
         MonitorConfig::Tcp(c) => {
-            if c.host.is_empty() {
-                errors.push("host is required".into());
-            }
+            require_host(&c.host, &mut errors);
             if c.port == 0 {
                 errors.push("port must be between 1 and 65535".into());
             }
         }
         MonitorConfig::Icmp(c) => {
-            if c.host.is_empty() {
-                errors.push("host is required".into());
-            }
+            require_host(&c.host, &mut errors);
         }
         MonitorConfig::PublicIp(c) => {
             // url is optional; if given it must be http(s).
             if let Some(url) = &c.url {
-                if !url.starts_with("http://") && !url.starts_with("https://") {
+                if !is_http_url(url) {
                     errors.push("url must be a valid http or https URL".into());
                 }
             }
@@ -369,7 +418,7 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
         }
         MonitorConfig::Traceroute(c) => {
             if c.host.is_empty() {
-                errors.push("host is required".into());
+                require_host(&c.host, &mut errors);
             } else if !is_valid_host(&c.host) {
                 errors.push("host must be a valid IP or host".into());
             }
@@ -377,6 +426,17 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
     }
 
     errors
+}
+
+fn is_http_url(u: &str) -> bool {
+    u.starts_with("http://") || u.starts_with("https://")
+}
+
+/// Push the shared "host is required" error when a host field is empty.
+fn require_host(host: &str, errors: &mut Vec<String>) {
+    if host.is_empty() {
+        errors.push("host is required".into());
+    }
 }
 
 /// A pragmatic IP-or-hostname check: a parseable IP, or a non-empty token with no

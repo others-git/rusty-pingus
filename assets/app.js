@@ -48,29 +48,22 @@ function dashboard() {
     },
 
     connectStream() {
-      if (!('EventSource' in window)) return; // no SSE support → poll-only
-      try {
-        eventSource = new EventSource('/api/monitors/stream');
-      } catch (e) {
-        console.warn('SSE unavailable, relying on poll', e);
-        return;
-      }
-      eventSource.onmessage = (ev) => {
-        let u;
-        try { u = JSON.parse(ev.data); } catch (e) { return; }
-        const m = this.monitors.find(x => x.name === u.name);
-        if (!m) return; // not in the list yet — the next poll will add it
-        // Update the card's live fields in place; up/down counts are getters
-        // and recompute automatically. 24h uptime stays on the poll.
-        m.status = u.status;
-        m.response_time_ms = u.response_time_ms;
-        m.last_checked_at = u.last_checked_at;
-        m.failure_reason = u.failure_reason;
-        m.detail = u.detail;
-        this.lastUpdated = this.formatRelative(new Date().toISOString());
-      };
-      // On error the browser auto-reconnects; the poll covers any gap meanwhile.
-      eventSource.onerror = () => {};
+      // Shared subscribe helper; the poll (init) covers any gap if SSE is down.
+      eventSource = window.RP.subscribeStatus({
+        onUpdate: (u) => {
+          const m = this.monitors.find(x => x.name === u.name);
+          if (!m) return; // not in the list yet — the next poll will add it
+          // Update the card's live fields in place; up/down counts are getters
+          // and recompute automatically. 24h uptime stays on the poll.
+          m.status = u.status;
+          m.response_time_ms = u.response_time_ms;
+          m.last_checked_at = u.last_checked_at;
+          m.failure_reason = u.failure_reason;
+          m.detail = u.detail;
+          this.lastUpdated = this.formatRelative(new Date().toISOString());
+        },
+        onError: () => {}, // browser auto-reconnects; the poll covers the gap
+      });
     },
 
     async fetchMonitors() {
@@ -82,6 +75,21 @@ function dashboard() {
         console.error('Poll failed', e);
       } finally {
         this.loading = false;
+      }
+    },
+
+    async toggleMonitor(m) {
+      const next = !m.enabled;
+      m.enabled = next; // optimistic; revert on failure
+      try {
+        const res = await fetch(`/api/monitors/${encodeURIComponent(m.name)}/enabled`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: next }),
+        });
+        if (!res.ok) { m.enabled = !next; return; }
+      } catch (e) {
+        m.enabled = !next; // network error → undo
       }
     },
 
@@ -186,12 +194,7 @@ function dashboard() {
     },
 
     formatRelative(iso) {
-      const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
-      if (diff < 10) return 'just now';
-      if (diff < 60) return `${diff}s ago`;
-      if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-      if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-      return `${Math.floor(diff / 86400)}d ago`;
+      return window.RP.formatRelative(iso);
     },
 
     protocolIcon(protocol) {

@@ -103,6 +103,7 @@ pub async fn serve(bind: String, state: AppState, cancel: CancellationToken) {
         // Monitor config CRUD
         .route("/api/monitors/config", get(api::list_monitor_configs))
         .route("/api/monitors", post(api::add_monitor))
+        .route("/api/monitors/:name/enabled", post(api::set_monitor_enabled))
         .route("/api/monitors/:name", delete(api::delete_monitor))
         // Static assets catch-all
         .route("/*path", get(serve_asset))
