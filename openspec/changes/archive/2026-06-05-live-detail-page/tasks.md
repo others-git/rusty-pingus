@@ -28,4 +28,4 @@
 - [x] 5.2 With the page open, confirm header status/detail (e.g. current public IP) updates within ~1s of a new probe, and that zoom/pan position is preserved across updates.
 - [x] 5.3 Confirm a freshly-opened empty window shows "no data/collecting" rather than "unreachable", and that a genuine latest-probe failure still shows "unreachable".
 - [x] 5.4 Simulate SSE unavailable (block the stream) and confirm the page still updates via the poll fallback.
-- [ ] 5.5 Update the `live-status-updates` and `web-ui` main specs via the change's deltas at archive time (no stale "detail pages stay static" requirement remains).
+- [x] 5.5 Update the `live-status-updates` and `web-ui` main specs via the change's deltas at archive time (no stale "detail pages stay static" requirement remains).

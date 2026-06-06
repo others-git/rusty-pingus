@@ -49,4 +49,4 @@
 - [x] 7.4 Confirm an unreachable/timing-out hop renders as unreachable without breaking the run, and the monitor still appears on the dashboard/live stream. (Per-hop `loss` observed; privilege failure produced a clean down (no panic); dashboard summary shows the monitor `up` with an "N hops" detail. Unreachable-row rendering implemented.)
 - [~] 7.5 Confirm the prune deletes data older than retention (e.g. set a short retention) and that database growth is bounded. (`prune_traceroute` + 60s `traceroute_retention_loop` implemented; not runtime-verified — would need to wait a prune cycle.)
 - [ ] 7.6 Verify on Windows (raw-socket behavior) or document the limitation if blocked. (Not run — no Windows host here. Risk documented in design.md; IPv6 also returns a clean `ipv6_unsupported`.)
-- [ ] 7.7 Sync the modified specs (`monitor-config`, `probe-engine`, `result-storage`, `web-ui`) and the new `traceroute-monitor` spec at archive time.
+- [x] 7.7 Sync the modified specs (`monitor-config`, `probe-engine`, `result-storage`, `web-ui`) and the new `traceroute-monitor` spec at archive time.

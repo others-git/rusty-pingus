@@ -268,3 +268,95 @@ The public-IP monitor detail view SHALL be oriented around tracking the external
 #### Scenario: IP timeline is the primary chart
 - **WHEN** a public-IP monitor's detail page renders its primary chart
 - **THEN** it shows the IP-over-time state timeline, not a response-time line
+
+### Requirement: Add public-IP and border monitors from the UI
+The add-monitor modal SHALL offer the public-IP and border monitor types alongside HTTP/TCP/ICMP, showing the fields relevant to each (public-IP: an optional service URL; border: an optional gateway and an upstream target), and submit them to `POST /api/monitors`.
+
+#### Scenario: Public-IP type selectable
+- **WHEN** a user opens the add-monitor modal and selects the public-IP type
+- **THEN** the form shows the public-IP fields and can create a public-IP monitor
+
+#### Scenario: Border type selectable
+- **WHEN** a user selects the border type
+- **THEN** the form shows gateway and upstream fields and can create a border monitor
+
+### Requirement: Display per-probe detail
+The dashboard and monitor detail views SHALL surface a probe's detail when present — e.g. the current public IP for a public-IP monitor, or the fault localization for a border monitor — without disrupting the existing card/detail layout.
+
+#### Scenario: Public IP shown
+- **WHEN** a public-IP monitor has a recorded IP
+- **THEN** that IP is shown on its card / detail view
+
+#### Scenario: Border status shown
+- **WHEN** a border monitor has a fault classification (e.g. ISP down vs LAN down)
+- **THEN** that classification is shown on its card / detail view
+
+#### Scenario: No detail, no clutter
+- **WHEN** a monitor has no detail (e.g. a plain HTTP check)
+- **THEN** no extra detail element is shown for it
+
+### Requirement: Detail page refreshes live without disrupting interaction
+The monitor detail page SHALL refresh in place as new probe results arrive for the monitor being viewed (via the live status stream, with a periodic poll as fallback). The refresh SHALL update the header status/detail and the metrics strip, and SHALL update the active-window chart or state-timeline data so newly arrived samples appear without a manual reload. A live refresh SHALL NOT reset or interfere with the user's current zoom/pan position, and SHALL NOT interrupt a pending zoom/pan-triggered refetch.
+
+#### Scenario: Active window fills in as data arrives
+- **WHEN** the detail page is showing a window that currently has no samples and new probe results arrive for the monitor
+- **THEN** the metrics strip and chart/timeline update in place to show the arriving data, without the user reloading
+
+#### Scenario: Live refresh preserves zoom and pan
+- **WHEN** the user has zoomed or panned the chart and a live update arrives
+- **THEN** the view stays at the user's current position rather than snapping back to the full window
+
+#### Scenario: Header status reflects the latest probe
+- **WHEN** a monitor's status or detail changes while its detail page is open with a live connection
+- **THEN** the page's status indicator and type-specific detail (e.g. current public IP) update within about a second
+
+### Requirement: Detail view distinguishes no-data from unreachable
+The monitor detail view SHALL visually distinguish a window that has no samples yet ("no data" / "collecting") from a monitor whose most recent probe failed ("down" / "unreachable"). When a window contains no samples, the public-IP strip and the chart/timeline area SHALL present a neutral no-data state rather than implying the monitor or its target is unreachable.
+
+#### Scenario: Empty window shows a no-data state
+- **WHEN** a public-IP monitor's detail page is opened for a window that has no recorded probes yet
+- **THEN** the "Current IP" field shows a neutral no-data/collecting state (not "unreachable"), and the chart area indicates there is no data in the window
+
+#### Scenario: Failed latest probe shows unreachable
+- **WHEN** a public-IP monitor has samples in the window and its most recent probe failed (no IP recorded)
+- **THEN** the "Current IP" field shows "unreachable", distinct from the no-data state
+
+### Requirement: Traceroute detail page with per-hop table
+The monitor detail page SHALL render a purpose-built layout for `traceroute` monitors: a table with one row per hop showing the hop number, the hop address (with reachable / unreachable state), and the hop's average, minimum, and maximum round-trip time over the active time range. This layout SHALL be used instead of the response-time line chart and state timeline used by other monitor types.
+
+#### Scenario: Hops shown as table rows
+- **WHEN** a user opens a traceroute monitor's detail page
+- **THEN** each hop on the path is shown as a table row with its number, address, reachable state, and avg/min/max RTT
+
+#### Scenario: Unreachable hop is visibly distinguished
+- **WHEN** a hop did not respond over the active range
+- **THEN** its row indicates the unreachable state rather than showing a misleading latency
+
+### Requirement: Per-hop latency graph
+The traceroute detail page SHALL visualize per-hop latency as a single connected graph aligned to the hop rows: for each hop a band spanning its minimum-to-maximum RTT and a marker at its average, with the per-hop averages joined by a line down the hops, so relative latency across the path is readable at a glance. A non-responding hop SHALL be shown without a band or marker rather than as zero latency.
+
+#### Scenario: Latency shown as a connected per-hop graph
+- **WHEN** the hop table renders
+- **THEN** each hop shows a min–max band and an average marker, and the per-hop averages are connected into one graph down the rows
+
+#### Scenario: Non-responding hop leaves a gap
+- **WHEN** a hop did not respond over the active range
+- **THEN** it shows no band or average marker rather than a latency of zero
+
+### Requirement: Resizable time-range brush for traceroute data
+The traceroute detail page SHALL provide a resizable scroll/brush control that selects the time range used to compute the per-hop table, operating within the monitor's retained data. Adjusting the control SHALL re-aggregate the table over the selected range. The page SHALL NOT use the fixed 1h/24h/7d/30d uptime windows for this monitor type.
+
+#### Scenario: Adjusting the brush re-aggregates the table
+- **WHEN** the user resizes or moves the time-range brush
+- **THEN** the per-hop table's reachability and min/avg/max recompute over the newly selected range
+
+#### Scenario: No fixed uptime windows for traceroute
+- **WHEN** a traceroute monitor's detail page renders
+- **THEN** it presents the retention-bounded brush control rather than the 1h/24h/7d/30d window selectors
+
+### Requirement: Add-monitor form supports traceroute
+The add-monitor form SHALL allow creating a `traceroute` monitor, collecting the target host, check interval (with the 500 ms minimum enforced), per-hop timeout, maximum hops, queries-per-hop, and retention.
+
+#### Scenario: Create a traceroute monitor from the UI
+- **WHEN** a user selects the traceroute type and submits a target with valid fields
+- **THEN** a traceroute monitor is created with those settings, with the interval clamped to at least 500 ms
