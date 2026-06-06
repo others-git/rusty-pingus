@@ -390,7 +390,277 @@ pub async fn delete_results(pool: &SqlitePool, monitor_name: &str) -> Result<u64
         .bind(monitor_name)
         .execute(pool)
         .await?;
+    // Also clear any traceroute data for this monitor (best-effort; ignore if none).
+    let _ = delete_traceroute(pool, monitor_name).await;
     Ok(result.rows_affected())
+}
+
+// ── Traceroute storage ─────────────────────────────────────────────────────────
+
+/// One hop's per-run statistics, as produced by the traceroute probe and handed
+/// to storage. A non-responding hop has `addr = None` and null RTTs; `loss` is the
+/// number of the run's queries at this hop that got no reply.
+#[derive(Debug, Clone)]
+pub struct TraceHopInput {
+    pub hop_no: i64,
+    pub addr: Option<String>,
+    pub min_us: Option<i64>,
+    pub avg_us: Option<i64>,
+    pub max_us: Option<i64>,
+    pub loss: i64,
+}
+
+/// A single traceroute run: whether the destination replied, and its hops.
+#[derive(Debug, Clone)]
+pub struct TraceRunInput {
+    pub reached: bool,
+    pub hops: Vec<TraceHopInput>,
+}
+
+/// Persist one traceroute run: insert the run, intern each hop address (so a
+/// stable route stores each address once), and write the hop rows — all in one
+/// transaction. `rtt_us` mirrors `avg_us` as the hop's representative latency.
+pub async fn insert_traceroute(
+    pool: &SqlitePool,
+    monitor_name: &str,
+    checked_at: DateTime<Utc>,
+    run: &TraceRunInput,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let run_id: i64 = sqlx::query(
+        "INSERT INTO traceroute_runs (monitor_name, checked_at, reached, hop_count)
+         VALUES (?, ?, ?, ?) RETURNING id",
+    )
+    .bind(monitor_name)
+    .bind(checked_at.to_rfc3339())
+    .bind(if run.reached { 1 } else { 0 })
+    .bind(run.hops.len() as i64)
+    .fetch_one(&mut *tx)
+    .await?
+    .try_get("id")?;
+
+    for hop in &run.hops {
+        let addr_id: Option<i64> = match &hop.addr {
+            Some(addr) => {
+                // Intern: insert if new, then read back the id (upsert keeps it unique).
+                sqlx::query("INSERT INTO traceroute_addrs (addr) VALUES (?) ON CONFLICT(addr) DO NOTHING")
+                    .bind(addr)
+                    .execute(&mut *tx)
+                    .await?;
+                let id: i64 = sqlx::query("SELECT id FROM traceroute_addrs WHERE addr = ?")
+                    .bind(addr)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get("id")?;
+                Some(id)
+            }
+            None => None,
+        };
+
+        sqlx::query(
+            "INSERT INTO traceroute_hops (run_id, hop_no, addr_id, rtt_us, min_us, avg_us, max_us, loss)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(run_id)
+        .bind(hop.hop_no)
+        .bind(addr_id)
+        .bind(hop.avg_us)
+        .bind(hop.min_us)
+        .bind(hop.avg_us)
+        .bind(hop.max_us)
+        .bind(hop.loss)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Per-hop aggregate over a time range, for the traceroute detail table.
+#[derive(Debug, Serialize)]
+pub struct TraceHopAgg {
+    pub hop_no: i64,
+    /// Most recent address seen at this hop in range, or null if it never responded.
+    pub addr: Option<String>,
+    pub reachable: bool,
+    pub samples: i64,
+    pub loss: i64,
+    pub min_ms: Option<f64>,
+    pub avg_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+}
+
+/// Aggregate a monitor's traceroute hops over `[from, to]`: per hop position,
+/// reachability and min/avg/max RTT across the runs in the range, with the
+/// address taken from the most recent run in range.
+pub async fn get_traceroute_hops(
+    pool: &SqlitePool,
+    monitor_name: &str,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<TraceHopAgg>> {
+    let from_str = from.to_rfc3339();
+    let to_str = to.to_rfc3339();
+
+    // Aggregates per hop position across all runs in range (RTTs in microseconds).
+    let rows = sqlx::query(
+        // CAST MIN/MAX to REAL: over an INTEGER column they keep integer affinity,
+        // which fails to decode as f64; AVG already yields REAL.
+        "SELECT h.hop_no AS hop_no,
+                CAST(MIN(h.min_us) AS REAL) AS min_us,
+                AVG(h.avg_us) AS avg_us,
+                CAST(MAX(h.max_us) AS REAL) AS max_us,
+                SUM(h.loss) AS loss,
+                COUNT(*) AS samples,
+                SUM(CASE WHEN h.addr_id IS NOT NULL THEN 1 ELSE 0 END) AS responded
+         FROM traceroute_hops h
+         JOIN traceroute_runs r ON h.run_id = r.id
+         WHERE r.monitor_name = ? AND r.checked_at >= ? AND r.checked_at <= ?
+         GROUP BY h.hop_no
+         ORDER BY h.hop_no",
+    )
+    .bind(monitor_name)
+    .bind(&from_str)
+    .bind(&to_str)
+    .fetch_all(pool)
+    .await?;
+
+    // Address per hop from the most recent run in range (the current path).
+    let latest_run: Option<i64> = sqlx::query(
+        "SELECT MAX(id) AS id FROM traceroute_runs
+         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?",
+    )
+    .bind(monitor_name)
+    .bind(&from_str)
+    .bind(&to_str)
+    .fetch_one(pool)
+    .await?
+    .try_get::<Option<i64>, _>("id")?;
+
+    let mut addr_by_hop: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+    if let Some(run_id) = latest_run {
+        let arows = sqlx::query(
+            "SELECT h.hop_no AS hop_no, a.addr AS addr
+             FROM traceroute_hops h
+             JOIN traceroute_addrs a ON h.addr_id = a.id
+             WHERE h.run_id = ?",
+        )
+        .bind(run_id)
+        .fetch_all(pool)
+        .await?;
+        for row in arows {
+            let hop_no: i64 = row.try_get("hop_no")?;
+            let addr: String = row.try_get("addr")?;
+            addr_by_hop.insert(hop_no, addr);
+        }
+    }
+
+    let us_to_ms = |v: Option<f64>| v.map(|u| u / 1000.0);
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let hop_no: i64 = row.try_get("hop_no")?;
+        let responded: i64 = row.try_get("responded").unwrap_or(0);
+        out.push(TraceHopAgg {
+            hop_no,
+            addr: addr_by_hop.get(&hop_no).cloned(),
+            reachable: responded > 0,
+            samples: row.try_get("samples").unwrap_or(0),
+            loss: row.try_get("loss").unwrap_or(0),
+            min_ms: us_to_ms(row.try_get::<Option<f64>, _>("min_us").ok().flatten()),
+            avg_ms: us_to_ms(row.try_get::<Option<f64>, _>("avg_us").ok().flatten()),
+            max_ms: us_to_ms(row.try_get::<Option<f64>, _>("max_us").ok().flatten()),
+        });
+    }
+    Ok(out)
+}
+
+/// The retained time extent of a monitor's traceroute data (earliest/latest run
+/// timestamps), so the UI brush knows its bounds. None when there is no data.
+pub async fn get_traceroute_extent(
+    pool: &SqlitePool,
+    monitor_name: &str,
+) -> Result<Option<(String, String)>> {
+    let row = sqlx::query(
+        "SELECT MIN(checked_at) AS lo, MAX(checked_at) AS hi
+         FROM traceroute_runs WHERE monitor_name = ?",
+    )
+    .bind(monitor_name)
+    .fetch_one(pool)
+    .await?;
+    let lo: Option<String> = row.try_get("lo")?;
+    let hi: Option<String> = row.try_get("hi")?;
+    Ok(match (lo, hi) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        _ => None,
+    })
+}
+
+/// Prune a monitor's traceroute runs (and their hops) older than `retention_ms`,
+/// then release interned addresses no longer referenced by any hop. Returns the
+/// number of runs deleted. Foreign-key cascade is not relied upon (PRAGMA
+/// foreign_keys is off), so hops are deleted explicitly.
+pub async fn prune_traceroute(
+    pool: &SqlitePool,
+    monitor_name: &str,
+    retention_ms: u64,
+) -> Result<u64> {
+    let cutoff = (Utc::now() - chrono::Duration::milliseconds(retention_ms as i64)).to_rfc3339();
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "DELETE FROM traceroute_hops WHERE run_id IN
+            (SELECT id FROM traceroute_runs WHERE monitor_name = ? AND checked_at < ?)",
+    )
+    .bind(monitor_name)
+    .bind(&cutoff)
+    .execute(&mut *tx)
+    .await?;
+
+    let deleted = sqlx::query(
+        "DELETE FROM traceroute_runs WHERE monitor_name = ? AND checked_at < ?",
+    )
+    .bind(monitor_name)
+    .bind(&cutoff)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    sqlx::query(
+        "DELETE FROM traceroute_addrs WHERE id NOT IN
+            (SELECT addr_id FROM traceroute_hops WHERE addr_id IS NOT NULL)",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(deleted)
+}
+
+/// Delete all of a monitor's traceroute data (runs, hops) and GC orphan addresses.
+/// Used when a monitor is removed.
+pub async fn delete_traceroute(pool: &SqlitePool, monitor_name: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "DELETE FROM traceroute_hops WHERE run_id IN
+            (SELECT id FROM traceroute_runs WHERE monitor_name = ?)",
+    )
+    .bind(monitor_name)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM traceroute_runs WHERE monitor_name = ?")
+        .bind(monitor_name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM traceroute_addrs WHERE id NOT IN
+            (SELECT addr_id FROM traceroute_hops WHERE addr_id IS NOT NULL)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub async fn monitor_exists(pool: &SqlitePool, monitor_name: &str) -> Result<bool> {

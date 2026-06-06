@@ -137,6 +137,9 @@ async fn async_main(
     // drops oldest events and is reconciled by the dashboard's periodic poll.
     let (updates_tx, _) = tokio::sync::broadcast::channel(256);
 
+    // Clone the store for the traceroute prune loop before it moves into state.
+    let traceroute_store = monitor_store.clone();
+
     let state = AppState {
         pool: pool.clone(),
         monitors: monitor_store,
@@ -170,6 +173,12 @@ async fn async_main(
         tokio::spawn(scheduler::rollup_loop(pool, cancel))
     };
 
+    let traceroute_retention_handle = {
+        let pool = pool.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(scheduler::traceroute_retention_loop(pool, traceroute_store, cancel))
+    };
+
     #[cfg(not(windows))]
     if is_first_launch {
         let url = dashboard_url.clone();
@@ -191,6 +200,7 @@ async fn async_main(
         let _ = web_handle.await;
         if let Some(h) = retention_handle { let _ = h.await; }
         let _ = rollup_handle.await;
+        let _ = traceroute_retention_handle.await;
     });
     if drain.await.is_err() { tracing::warn!("Drain timeout exceeded"); }
 

@@ -3,6 +3,7 @@ pub mod http;
 pub mod icmp;
 pub mod publicip;
 pub mod tcp;
+pub mod traceroute;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;

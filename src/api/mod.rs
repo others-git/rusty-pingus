@@ -219,6 +219,47 @@ pub async fn monitor_series(
     }
 }
 
+// ── Traceroute endpoints ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct TraceParams {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// `GET /api/monitors/:name/traceroute?from&to` — per-hop aggregates over a range.
+pub async fn monitor_traceroute(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<TraceParams>,
+) -> impl IntoResponse {
+    let to = params.to.unwrap_or_else(Utc::now);
+    let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(1));
+    match db::get_traceroute_hops(&state.pool, &name, from, to).await {
+        Ok(hops) => Json(hops).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "DB error in monitor_traceroute");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
+        }
+    }
+}
+
+/// `GET /api/monitors/:name/traceroute/extent` — the retained data extent so the
+/// UI brush knows its bounds. `{ "from": null, "to": null }` when there is no data.
+pub async fn monitor_traceroute_extent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match db::get_traceroute_extent(&state.pool, &name).await {
+        Ok(Some((from, to))) => Json(serde_json::json!({ "from": from, "to": to })).into_response(),
+        Ok(None) => Json(serde_json::json!({ "from": null, "to": null })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "DB error in monitor_traceroute_extent");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
+        }
+    }
+}
+
 // ── Monitor CRUD endpoints ────────────────────────────────────────────────────
 
 pub async fn list_monitor_configs(State(state): State<AppState>) -> impl IntoResponse {
@@ -324,6 +365,13 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
             }
             if !is_valid_host(&c.upstream) {
                 errors.push("upstream must be a valid IP or host".into());
+            }
+        }
+        MonitorConfig::Traceroute(c) => {
+            if c.host.is_empty() {
+                errors.push("host is required".into());
+            } else if !is_valid_host(&c.host) {
+                errors.push("host must be a valid IP or host".into());
             }
         }
     }

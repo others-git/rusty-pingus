@@ -97,6 +97,9 @@ pub async fn serve(bind: String, state: AppState, cancel: CancellationToken) {
         .route("/api/monitors/:name/history", get(api::monitor_history))
         .route("/api/monitors/:name/uptime", get(api::monitor_uptime))
         .route("/api/monitors/:name/series", get(api::monitor_series))
+        // Traceroute per-hop data + retained extent (more specific route first)
+        .route("/api/monitors/:name/traceroute/extent", get(api::monitor_traceroute_extent))
+        .route("/api/monitors/:name/traceroute", get(api::monitor_traceroute))
         // Monitor config CRUD
         .route("/api/monitors/config", get(api::list_monitor_configs))
         .route("/api/monitors", post(api::add_monitor))

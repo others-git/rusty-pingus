@@ -52,6 +52,17 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # interval_ms = 30000
 # gateway = "192.168.1.1"  # optional; auto-detected when omitted
 # upstream = "1.1.1.1"      # upstream reference (default 1.1.1.1)
+
+# Traceroute monitor example (per-hop path latency; requires ICMP privileges):
+# [[monitors]]
+# protocol = "traceroute"
+# name = "path-to-cloudflare"
+# host = "1.1.1.1"
+# interval_ms = 5000        # minimum 500 ms is enforced for this type
+# timeout_ms = 1000         # per-hop reply wait
+# max_hops = 30             # optional (default 30)
+# queries_per_hop = 3       # optional (default 3)
+# retention_ms = 86400000   # optional (default 24h); bounds stored per-hop data
 "#;
 
 // ── Monitor config types ──────────────────────────────────────────────────────
@@ -65,6 +76,7 @@ pub enum MonitorConfig {
     #[serde(rename = "publicip")]
     PublicIp(PublicIpMonitorConfig),
     Border(BorderMonitorConfig),
+    Traceroute(TracerouteMonitorConfig),
 }
 
 /// Default service for the public-IP monitor; `icanhazip.com` is the fallback.
@@ -72,6 +84,9 @@ pub const DEFAULT_PUBLICIP_URL: &str = "https://checkip.amazonaws.com";
 pub const FALLBACK_PUBLICIP_URL: &str = "https://icanhazip.com";
 /// Default upstream reference for the border monitor.
 pub const DEFAULT_BORDER_UPSTREAM: &str = "1.1.1.1";
+/// Minimum scheduling interval for a traceroute monitor: a run is expensive and
+/// high-volume, so the interval is clamped to this floor rather than rejected.
+pub const TRACEROUTE_MIN_INTERVAL_MS: u64 = 500;
 
 impl MonitorConfig {
     pub fn name(&self) -> &str {
@@ -81,6 +96,7 @@ impl MonitorConfig {
             Self::Icmp(c) => &c.name,
             Self::PublicIp(c) => &c.name,
             Self::Border(c) => &c.name,
+            Self::Traceroute(c) => &c.name,
         }
     }
 
@@ -91,6 +107,7 @@ impl MonitorConfig {
             Self::Icmp(c) => c.interval_ms,
             Self::PublicIp(c) => c.interval_ms,
             Self::Border(c) => c.interval_ms,
+            Self::Traceroute(c) => c.interval_ms,
         }
     }
 
@@ -101,6 +118,7 @@ impl MonitorConfig {
             Self::Icmp(_) => "icmp",
             Self::PublicIp(_) => "publicip",
             Self::Border(_) => "border",
+            Self::Traceroute(_) => "traceroute",
         }
     }
 
@@ -116,6 +134,7 @@ impl MonitorConfig {
                 c.gateway.clone().unwrap_or_else(|| "auto".to_string()),
                 c.upstream
             ),
+            Self::Traceroute(c) => c.host.clone(),
         }
     }
 }
@@ -183,8 +202,30 @@ pub struct BorderMonitorConfig {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawTracerouteMonitorConfig")]
+pub struct TracerouteMonitorConfig {
+    pub name: String,
+    /// Target host (IP or hostname) to trace the route to.
+    pub host: String,
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+    /// Maximum number of hops (TTL) to probe before giving up. Default 30.
+    pub max_hops: u32,
+    /// ICMP echoes sent per hop per run; the per-run min/avg/max are computed from
+    /// the responders. Default 3, clamped to a minimum of 1.
+    pub queries_per_hop: u32,
+    /// How long to retain this monitor's traceroute runs before pruning, in
+    /// milliseconds. Replaces the fixed rollup windows for this monitor type.
+    pub retention_ms: u64,
+}
+
 pub fn default_interval_ms() -> u64 { 60_000 }
 pub fn default_timeout_ms() -> u64 { 10_000 }
+fn default_traceroute_max_hops() -> u32 { 30 }
+fn default_traceroute_queries() -> u32 { 3 }
+/// Default traceroute retention: 24 hours.
+pub fn default_traceroute_retention_ms() -> u64 { 86_400_000 }
 fn default_icmp_count() -> u32 { 3 }
 fn default_border_upstream() -> String { DEFAULT_BORDER_UPSTREAM.to_string() }
 fn default_http_method() -> String { "GET".to_string() }
@@ -317,6 +358,36 @@ impl From<RawBorderMonitorConfig> for BorderMonitorConfig {
                 .unwrap_or_else(default_border_upstream),
             interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
             timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawTracerouteMonitorConfig {
+    name: String,
+    host: String,
+    #[serde(default)] interval_ms: Option<u64>,
+    #[serde(default)] interval_secs: Option<u64>,
+    #[serde(default)] timeout_ms: Option<u64>,
+    #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default)] max_hops: Option<u32>,
+    #[serde(default)] queries_per_hop: Option<u32>,
+    #[serde(default)] retention_ms: Option<u64>,
+    #[serde(default)] retention_secs: Option<u64>,
+}
+
+impl From<RawTracerouteMonitorConfig> for TracerouteMonitorConfig {
+    fn from(r: RawTracerouteMonitorConfig) -> Self {
+        Self {
+            name: r.name,
+            host: r.host,
+            // Enforce the 500 ms interval floor uniformly across config + UI paths.
+            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms())
+                .max(TRACEROUTE_MIN_INTERVAL_MS),
+            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            max_hops: r.max_hops.unwrap_or_else(default_traceroute_max_hops).clamp(1, 64),
+            queries_per_hop: r.queries_per_hop.unwrap_or_else(default_traceroute_queries).max(1),
+            retention_ms: resolve_ms(r.retention_ms, r.retention_secs, default_traceroute_retention_ms()),
         }
     }
 }
@@ -468,6 +539,12 @@ pub fn apply_defaults(monitors: &mut Vec<MonitorConfig>, defaults: &Defaults) {
                 if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
                 if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
             }
+            MonitorConfig::Traceroute(c) => {
+                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
+                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
+                // Re-apply the floor in case a global default lowered the interval.
+                c.interval_ms = c.interval_ms.max(TRACEROUTE_MIN_INTERVAL_MS);
+            }
         }
     }
 }
@@ -565,5 +642,47 @@ mod tests {
             "[[monitors]]\nprotocol = \"icmp\"\nname = \"gw\"\nhost = \"1.1.1.1\"\ncount = 5\n",
         );
         assert_eq!(c.count, 5);
+    }
+
+    fn parse_traceroute(toml_body: &str) -> TracerouteMonitorConfig {
+        let file: MonitorsFile = toml::from_str(toml_body).expect("valid TOML");
+        match file.monitors.into_iter().next().expect("one monitor") {
+            MonitorConfig::Traceroute(c) => c,
+            other => panic!("expected traceroute monitor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn traceroute_sub_floor_interval_is_raised_to_500() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\ninterval_ms = 100\n",
+        );
+        assert_eq!(c.interval_ms, 500);
+    }
+
+    #[test]
+    fn traceroute_at_or_above_floor_interval_is_preserved() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\ninterval_ms = 5000\n",
+        );
+        assert_eq!(c.interval_ms, 5000);
+    }
+
+    #[test]
+    fn traceroute_defaults_for_optional_fields() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\n",
+        );
+        assert_eq!(c.max_hops, 30);
+        assert_eq!(c.queries_per_hop, 3);
+        assert_eq!(c.retention_ms, 86_400_000);
+    }
+
+    #[test]
+    fn traceroute_zero_queries_clamped_to_one() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\nqueries_per_hop = 0\n",
+        );
+        assert_eq!(c.queries_per_hop, 1);
     }
 }

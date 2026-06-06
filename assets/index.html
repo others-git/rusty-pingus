@@ -180,7 +180,7 @@
       <div class="p-6">
         <!-- Protocol tabs -->
         <div class="flex gap-1 mb-5 bg-slate-900 rounded-lg p-1">
-          <template x-for="proto in ['http', 'tcp', 'icmp', 'publicip', 'border']" :key="proto">
+          <template x-for="proto in ['http', 'tcp', 'icmp', 'publicip', 'border', 'traceroute']" :key="proto">
             <button @click="form.protocol = proto; formErrors = {}"
                     class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors"
                     :class="form.protocol === proto
@@ -284,6 +284,35 @@
                      :class="formErrors.upstream ? 'border-red-500' : 'border-slate-700'" />
               <p x-show="formErrors.upstream" x-text="formErrors.upstream" class="text-red-400 text-xs mt-1"></p>
             </div>
+          </div>
+
+          <!-- Traceroute fields -->
+          <div x-show="form.protocol === 'traceroute'" class="flex flex-col gap-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Target Host / IP</label>
+              <input x-model="form.host" type="text" placeholder="1.1.1.1"
+                     class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                     :class="formErrors.host ? 'border-red-500' : 'border-slate-700'" />
+              <p x-show="formErrors.host" x-text="formErrors.host" class="text-red-400 text-xs mt-1"></p>
+            </div>
+            <div class="grid grid-cols-3 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-slate-400 mb-1">Max hops</label>
+                <input x-model.number="form.max_hops" type="number" min="1" max="64" step="1"
+                       class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-400 mb-1">Queries/hop</label>
+                <input x-model.number="form.queries_per_hop" type="number" min="1" max="10" step="1"
+                       class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-medium text-slate-400 mb-1">Retention (h)</label>
+                <input x-model.number="form.retention_hours" type="number" min="1" step="1"
+                       class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500" />
+              </div>
+            </div>
+            <p class="text-slate-600 text-xs">A run probes each hop and stores per-hop latency. Minimum interval is 500 ms.</p>
           </div>
 
           <!-- Interval + Timeout (all protocols) -->
