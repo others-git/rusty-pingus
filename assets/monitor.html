@@ -82,10 +82,11 @@
     <section x-show="timelineKind === 'publicip'" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
         <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">Current IP</div>
+        <!-- no samples in window → neutral "no data"; samples but no IP → "unreachable" -->
         <div class="text-xl font-bold font-mono truncate"
-             :class="ipCurrent ? 'text-cyan-300' : 'text-amber-400'"
-             :title="ipCurrent || 'unreachable'"
-             x-text="ipCurrent || 'unreachable'"></div>
+             :class="!hasData ? 'text-slate-500' : (ipCurrent ? 'text-cyan-300' : 'text-amber-400')"
+             :title="!hasData ? 'no data in this window yet' : (ipCurrent || 'unreachable')"
+             x-text="!hasData ? 'no data' : (ipCurrent || 'unreachable')"></div>
       </div>
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
         <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">Stable for</div>
