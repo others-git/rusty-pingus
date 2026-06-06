@@ -1,6 +1,0 @@
-[[monitors]]
-protocol = "icmp"
-name = "ping quad-9"
-host = "9.9.9.9"
-interval_ms = 500
-timeout_ms = 1000

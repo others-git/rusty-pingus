@@ -1,4 +1,9 @@
 function dashboard() {
+  // Held in a closure, deliberately OFF the reactive component object: Alpine
+  // would otherwise proxy the EventSource (host object), and reactive proxies
+  // over host objects are a known footgun here.
+  let eventSource = null;
+
   return {
     monitors: [],
     loading: true,
@@ -14,6 +19,8 @@ function dashboard() {
       port: 443,
       method: 'GET',
       expected_status: null,
+      gateway: '',
+      upstream: '1.1.1.1',
       interval_ms: 60000,
       timeout_ms: 10000,
     },
@@ -28,7 +35,39 @@ function dashboard() {
 
     async init() {
       await this.fetchMonitors();
+      // Periodic poll: fallback if SSE is unavailable/drops, and the source of
+      // truth for list membership (add/remove) and 24h uptime.
       setInterval(() => this.fetchMonitors(), 30_000);
+      // Live updates pushed from the server as probes complete.
+      this.connectStream();
+      // Best-effort teardown so we don't leak the connection on navigation.
+      window.addEventListener('beforeunload', () => { if (eventSource) eventSource.close(); });
+    },
+
+    connectStream() {
+      if (!('EventSource' in window)) return; // no SSE support → poll-only
+      try {
+        eventSource = new EventSource('/api/monitors/stream');
+      } catch (e) {
+        console.warn('SSE unavailable, relying on poll', e);
+        return;
+      }
+      eventSource.onmessage = (ev) => {
+        let u;
+        try { u = JSON.parse(ev.data); } catch (e) { return; }
+        const m = this.monitors.find(x => x.name === u.name);
+        if (!m) return; // not in the list yet — the next poll will add it
+        // Update the card's live fields in place; up/down counts are getters
+        // and recompute automatically. 24h uptime stays on the poll.
+        m.status = u.status;
+        m.response_time_ms = u.response_time_ms;
+        m.last_checked_at = u.last_checked_at;
+        m.failure_reason = u.failure_reason;
+        m.detail = u.detail;
+        this.lastUpdated = this.formatRelative(new Date().toISOString());
+      };
+      // On error the browser auto-reconnects; the poll covers any gap meanwhile.
+      eventSource.onerror = () => {};
     },
 
     async fetchMonitors() {
@@ -70,6 +109,12 @@ function dashboard() {
         body.url = this.form.url;
         body.method = this.form.method;
         if (this.form.expected_status) body.expected_status = this.form.expected_status;
+      } else if (this.form.protocol === 'publicip') {
+        // URL is optional; omit it to use the default service with fallback.
+        if (this.form.url && this.form.url.trim()) body.url = this.form.url.trim();
+      } else if (this.form.protocol === 'border') {
+        if (this.form.gateway && this.form.gateway.trim()) body.gateway = this.form.gateway.trim();
+        body.upstream = (this.form.upstream && this.form.upstream.trim()) || '1.1.1.1';
       } else {
         body.host = this.form.host;
         if (this.form.protocol === 'tcp') body.port = this.form.port;
@@ -104,6 +149,8 @@ function dashboard() {
       for (const msg of errors) {
         if (msg.includes('name')) this.formErrors.name = msg;
         else if (msg.includes('url')) this.formErrors.url = msg;
+        else if (msg.includes('gateway')) this.formErrors.gateway = msg;
+        else if (msg.includes('upstream')) this.formErrors.upstream = msg;
         else if (msg.includes('host')) this.formErrors.host = msg;
         else if (msg.includes('port')) this.formErrors.port = msg;
         else if (msg.includes('interval')) this.formErrors.interval_ms = msg;
@@ -121,6 +168,8 @@ function dashboard() {
         port: 443,
         method: 'GET',
         expected_status: null,
+        gateway: '',
+        upstream: '1.1.1.1',
         interval_ms: 60000,
         timeout_ms: 10000,
       };
@@ -141,8 +190,29 @@ function dashboard() {
         http: 'fa-solid fa-globe',
         tcp: 'fa-solid fa-network-wired',
         icmp: 'fa-solid fa-satellite-dish',
+        publicip: 'fa-solid fa-location-crosshairs',
+        border: 'fa-solid fa-shield-halved',
       };
       return icons[protocol] || 'fa-solid fa-circle-question';
+    },
+
+    protocolLabel(protocol) {
+      const labels = { publicip: 'Public IP', border: 'Border' };
+      return labels[protocol] || protocol.toUpperCase();
+    },
+
+    // Split a probe's detail for display. A border detail's trailing RTT group
+    // "(gw X, upstream Y)" is broken onto its own lines so it stays inside the
+    // card; other details render as a single line.
+    formatDetail(detail) {
+      if (!detail) return [];
+      const m = detail.match(/^(.*?)\s*\(gw\s*(.*?),\s*upstream\s*(.*?)\)\s*$/);
+      if (!m) return [detail];
+      const lines = [];
+      if (m[1].trim()) lines.push(m[1].trim());
+      lines.push(`gw ${m[2].trim()}`);
+      lines.push(`upstream ${m[3].trim()}`);
+      return lines;
     },
   };
 }

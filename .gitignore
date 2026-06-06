@@ -23,5 +23,19 @@ data/
 .DS_Store
 Thumbs.db
 
+# Prebuilt / standalone binaries (build artifacts, not source)
+/rusty-pingus-linux-*
+/rusty-pingus-windows-*
+*.exe
+
+# Manual backup copies (e.g. "data - Copy")
+* - Copy
+* - Copy/
+*.bak
+
+# App-specific / instance configs (not committed; each deployment keeps its own)
+/config.toml
+/monitors.toml
+
 # sqlx offline query cache (commit if using offline mode, otherwise ignore)
 # .sqlx/

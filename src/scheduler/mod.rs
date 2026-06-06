@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 use sqlx::SqlitePool;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::api::StatusUpdate;
 use crate::monitors::MonitorConfig;
 use crate::db;
 use crate::probe;
@@ -14,13 +15,14 @@ pub async fn run(
     pool: SqlitePool,
     cancel: CancellationToken,
     mut monitor_rx: watch::Receiver<Vec<MonitorConfig>>,
+    updates: broadcast::Sender<StatusUpdate>,
 ) {
     // Track per-monitor cancel tokens so we can stop individual tasks.
     let mut task_tokens: HashMap<String, CancellationToken> = HashMap::new();
 
     // Spawn initial tasks
     for monitor in &initial_monitors {
-        let token = spawn_monitor(monitor.clone(), pool.clone(), cancel.clone());
+        let token = spawn_monitor(monitor.clone(), pool.clone(), cancel.clone(), updates.clone());
         task_tokens.insert(monitor.name().to_string(), token);
     }
 
@@ -37,7 +39,7 @@ pub async fn run(
             }
             Ok(()) = monitor_rx.changed() => {
                 let new_monitors = monitor_rx.borrow_and_update().clone();
-                diff_and_reload(&mut task_tokens, &new_monitors, &pool, &cancel);
+                diff_and_reload(&mut task_tokens, &new_monitors, &pool, &cancel, &updates);
             }
         }
     }
@@ -48,6 +50,7 @@ fn diff_and_reload(
     new_monitors: &[MonitorConfig],
     pool: &SqlitePool,
     global_cancel: &CancellationToken,
+    updates: &broadcast::Sender<StatusUpdate>,
 ) {
     let new_names: std::collections::HashSet<String> =
         new_monitors.iter().map(|m| m.name().to_string()).collect();
@@ -71,7 +74,7 @@ fn diff_and_reload(
     for monitor in new_monitors {
         if !old_name_set.contains(monitor.name()) {
             info!(monitor = %monitor.name(), "Starting new monitor");
-            let token = spawn_monitor(monitor.clone(), pool.clone(), global_cancel.clone());
+            let token = spawn_monitor(monitor.clone(), pool.clone(), global_cancel.clone(), updates.clone());
             task_tokens.insert(monitor.name().to_string(), token);
         }
     }
@@ -81,6 +84,7 @@ fn spawn_monitor(
     monitor: MonitorConfig,
     pool: SqlitePool,
     global_cancel: CancellationToken,
+    updates: broadcast::Sender<StatusUpdate>,
 ) -> CancellationToken {
     let task_cancel = CancellationToken::new();
     let task_cancel_clone = task_cancel.clone();
@@ -94,7 +98,7 @@ fn spawn_monitor(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    match run_probe(&monitor, &pool).await {
+                    match run_probe(&monitor, &pool, &updates).await {
                         Ok(()) => {}
                         Err(e) => error!(monitor = %name, error = %e, "Probe error"),
                     }
@@ -113,15 +117,24 @@ fn spawn_monitor(
     task_cancel
 }
 
-async fn run_probe(monitor: &MonitorConfig, pool: &SqlitePool) -> anyhow::Result<()> {
+async fn run_probe(
+    monitor: &MonitorConfig,
+    pool: &SqlitePool,
+    updates: &broadcast::Sender<StatusUpdate>,
+) -> anyhow::Result<()> {
     let result = match monitor {
         MonitorConfig::Http(cfg) => probe::http::run(cfg).await,
         MonitorConfig::Tcp(cfg) => probe::tcp::run(cfg).await,
         MonitorConfig::Icmp(cfg) => probe::icmp::run(cfg).await,
+        MonitorConfig::PublicIp(cfg) => probe::publicip::run(cfg, pool).await,
+        MonitorConfig::Border(cfg) => probe::border::run(cfg).await,
     };
     if let Err(e) = db::insert_result(pool, &result).await {
         warn!(error = %e, "Failed to persist probe result");
     }
+    // Push a live status update to any connected dashboards. Built directly from
+    // the ProbeResult (no extra query); a send error just means no subscribers.
+    let _ = updates.send(StatusUpdate::from(&result));
     Ok(())
 }
 

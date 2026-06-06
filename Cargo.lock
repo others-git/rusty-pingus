@@ -2509,6 +2509,7 @@ dependencies = [
  "surge-ping",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tokio-test",
  "tokio-util",
  "toml",
@@ -3197,6 +3198,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

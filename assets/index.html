@@ -21,7 +21,10 @@
     }
   </script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
+  <script>try{var t=localStorage.getItem('theme');if(t&&t!=='default')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
   <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script defer src="/theme.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased" x-data="dashboard()" @keydown.escape.window="showAddModal = false; pendingDelete = null">
 
@@ -113,6 +116,19 @@
               </div>
             </div>
             <div class="text-xs text-slate-400 truncate mb-3" x-text="m.endpoint"></div>
+            <!-- Type-specific detail (e.g. current public IP, border fault class).
+                 Wraps inside the card; border RTTs break onto their own lines. -->
+            <div x-show="m.detail" class="mb-3">
+              <div class="inline-flex items-start gap-1.5 max-w-full px-2 py-1 rounded-md bg-cyan-400/10 text-cyan-300 text-xs"
+                   :title="m.detail">
+                <i class="fa-solid fa-circle-info text-cyan-500/70 mt-0.5"></i>
+                <span class="min-w-0 break-words">
+                  <template x-for="(line, i) in formatDetail(m.detail)" :key="i">
+                    <span class="block" x-text="line"></span>
+                  </template>
+                </span>
+              </div>
+            </div>
             <div class="flex gap-4 text-xs text-slate-400 mb-2">
               <span>
                 <i class="fa-solid fa-bolt text-slate-600 mr-1"></i>
@@ -164,13 +180,13 @@
       <div class="p-6">
         <!-- Protocol tabs -->
         <div class="flex gap-1 mb-5 bg-slate-900 rounded-lg p-1">
-          <template x-for="proto in ['http', 'tcp', 'icmp']" :key="proto">
+          <template x-for="proto in ['http', 'tcp', 'icmp', 'publicip', 'border']" :key="proto">
             <button @click="form.protocol = proto; formErrors = {}"
-                    class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors capitalize"
+                    class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors"
                     :class="form.protocol === proto
                       ? 'bg-cyan-600 text-white'
                       : 'text-slate-400 hover:text-slate-200'">
-              <span x-text="proto.toUpperCase()"></span>
+              <span x-text="protocolLabel(proto)"></span>
             </button>
           </template>
         </div>
@@ -236,6 +252,37 @@
                      class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                      :class="formErrors.host ? 'border-red-500' : 'border-slate-700'" />
               <p x-show="formErrors.host" x-text="formErrors.host" class="text-red-400 text-xs mt-1"></p>
+            </div>
+          </div>
+
+          <!-- Public IP fields -->
+          <div x-show="form.protocol === 'publicip'" class="flex flex-col gap-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Service URL <span class="text-slate-600">(optional)</span></label>
+              <input x-model="form.url" type="url" placeholder="https://checkip.amazonaws.com"
+                     class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                     :class="formErrors.url ? 'border-red-500' : 'border-slate-700'" />
+              <p x-show="formErrors.url" x-text="formErrors.url" class="text-red-400 text-xs mt-1"></p>
+              <p class="text-slate-600 text-xs mt-1">Leave blank to use the default service (with a built-in fallback).</p>
+            </div>
+          </div>
+
+          <!-- Border fields -->
+          <div x-show="form.protocol === 'border'" class="flex flex-col gap-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Gateway <span class="text-slate-600">(optional)</span></label>
+              <input x-model="form.gateway" type="text" placeholder="auto-detect"
+                     class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                     :class="formErrors.gateway ? 'border-red-500' : 'border-slate-700'" />
+              <p x-show="formErrors.gateway" x-text="formErrors.gateway" class="text-red-400 text-xs mt-1"></p>
+              <p class="text-slate-600 text-xs mt-1">Leave blank to auto-detect the local default gateway.</p>
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-400 mb-1">Upstream</label>
+              <input x-model="form.upstream" type="text" placeholder="1.1.1.1"
+                     class="w-full bg-slate-900 border rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                     :class="formErrors.upstream ? 'border-red-500' : 'border-slate-700'" />
+              <p x-show="formErrors.upstream" x-text="formErrors.upstream" class="text-red-400 text-xs mt-1"></p>
             </div>
           </div>
 

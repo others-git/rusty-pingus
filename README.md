@@ -1,10 +1,10 @@
 # rusty-pingus
 
-Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP, TCP, and ICMP from your own network location. Stores results in SQLite and serves a web dashboard.
+Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP, TCP, ICMP, public-IP, and border checks from your own network location. Stores results in SQLite and serves a web dashboard.
 
 ## Features
 
-- HTTP(S), TCP, and ICMP probing
+- HTTP(S), TCP, ICMP, public-IP, and border probing
 - Per-monitor configurable intervals and timeouts
 - SQLite persistence with automatic migrations
 - Web dashboard at `http://localhost:3000`
@@ -81,6 +81,22 @@ protocol = "icmp"
 name = "gateway"
 host = "192.168.1.1"
 interval_ms = 30000
+count = 3  # echo requests per cycle; up if any reply (default 3, min 1)
+
+# Public-IP monitor — tracks your external IP and flags changes
+[[monitors]]
+protocol = "publicip"
+name = "my-public-ip"
+interval_ms = 300000
+# url = "https://checkip.amazonaws.com"  # optional; default has a built-in fallback
+
+# Border monitor — localizes LAN vs ISP faults (requires ICMP privileges)
+[[monitors]]
+protocol = "border"
+name = "home-border"
+interval_ms = 30000
+# gateway = "192.168.1.1"  # optional; auto-detected when omitted
+upstream = "1.1.1.1"        # upstream reference (default 1.1.1.1)
 ```
 
 ### Configuration Reference
@@ -108,7 +124,25 @@ interval_ms = 30000
 
 **TCP monitor fields:** `name`, `host`, `port`, `interval_ms`, `timeout_ms`
 
-**ICMP monitor fields:** `name`, `host`, `interval_ms`, `timeout_ms`
+**ICMP monitor fields:** `name`, `host`, `interval_ms`, `timeout_ms`, `count`
+
+The ICMP probe sends `count` echo requests per cycle (default 3, minimum 1), each bounded by `timeout_ms`. The monitor is reported **up if at least one** reply is received and **down only when all** echoes are lost; the recorded response time is the best (lowest) RTT among the replies. Packet loss is surfaced in the failure reason — a partial loss is noted while the monitor stays up (`partial_loss (1/3 replies)`), and a full loss reports the counts (`no_reply (0/3 replies)`). Set `count = 1` to reproduce single-shot behavior. This makes ICMP monitors resilient to the incidental packet loss common on lossy or VPN-tunneled links.
+
+**Public-IP monitor fields:** `name`, `interval_ms`, `timeout_ms`, `url` (optional)
+
+The public-IP monitor (`protocol = "publicip"`) periodically GETs an IP-echo service and records your host's external IP. `url` is optional: when omitted it queries `https://checkip.amazonaws.com` and falls back to `https://icanhazip.com` if that fails. The monitor is **up** when a service returns a parseable IP address — which is shown as the probe's *detail* on the dashboard — and **down** when no IP can be obtained. When the IP differs from the previously recorded one, the change is surfaced in the detail (e.g. `203.0.113.7 (changed from 198.51.100.4)`) so it's visible in history. Useful for spotting ISP IP rotations that affect DNS, port-forwarding, or allow-lists.
+
+**Border monitor fields:** `name`, `interval_ms`, `timeout_ms`, `gateway` (optional), `upstream` (default `1.1.1.1`)
+
+The border monitor (`protocol = "border"`) localizes a connectivity fault — *"is it me or them?"* — by ICMP-pinging your local gateway **and** an upstream reference each cycle, then classifying the result (carried in the probe's *detail*):
+
+| Gateway | Upstream | Status | Detail |
+|---|---|---|---|
+| reachable | reachable | `up` | `ok` (with both RTTs) |
+| reachable | unreachable | `down` | `isp_down` — gateway up, internet down |
+| unreachable | (either) | `down` | `lan_down` — local gateway/LAN down |
+
+Overall status follows **upstream** reachability and the recorded response time is the upstream RTT. `gateway` is auto-detected from the system routing table when omitted (best-effort on Linux/macOS/Windows); if it can neither be configured nor detected, the monitor reports `down` with a clear reason rather than guessing — configuring `gateway` explicitly is the reliable path. Like ICMP monitors, the border monitor needs raw-socket privileges (see **ICMP Privileges** below).
 
 ## Running
 
@@ -163,6 +197,7 @@ TCP and HTTP probes work without elevated privileges.
 ## API
 
 - `GET /api/monitors` — current status of all monitors
+- `GET /api/monitors/stream` — Server-Sent Events stream of live status updates (one event per probe completion: name, status, response time, failure reason, last-checked time). The dashboard subscribes to this for near-real-time updates and falls back to polling `/api/monitors` if it's unavailable.
 - `GET /api/monitors/:name/history?from=<iso8601>&to=<iso8601>&limit=100` — raw probe history
 - `GET /api/monitors/:name/uptime` — uptime % for 1h, 24h, 7d, 30d windows
 - `GET /api/monitors/:name/series?from=<iso8601>&to=<iso8601>&buckets=300` — response time aggregated into a bounded number of time buckets (each: bucket start, avg/min/max ms, sample count, up-ratio). Used by the monitor detail chart so any window stays fast regardless of poll interval. `buckets` is clamped to 50–1000; defaults are the last 24h with ~300 buckets.

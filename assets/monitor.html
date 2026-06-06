@@ -23,7 +23,10 @@
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
   <!-- Apache ECharts: built-in dataZoom (wheel/drag/slider) + markArea for downtime; pinned. -->
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+  <script>try{var t=localStorage.getItem('theme');if(t&&t!=='default')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
   <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/themes.css" />
+  <script defer src="/theme.js"></script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased" x-data="monitorDetail()">
 
@@ -53,6 +56,14 @@
               x-text="currentStatus || 'pending'">
         </span>
       </div>
+
+      <!-- Type-specific detail (e.g. current public IP, border fault class) -->
+      <span x-show="detail" x-cloak
+            class="inline-flex items-center gap-1 ml-1 px-2 py-0.5 rounded-full bg-cyan-400/10 text-cyan-300 text-xs"
+            :title="detail">
+        <i class="fa-solid fa-circle-info text-cyan-500/70"></i>
+        <span x-text="detail"></span>
+      </span>
     </div>
   </header>
 
@@ -67,10 +78,35 @@
         x-transition:enter-end="opacity-100"
         class="max-w-5xl mx-auto px-6 py-8 flex flex-col gap-6">
 
-    <!-- ── Metrics strip (data-first) ─────────────────────────────────────── -->
-    <section class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <!-- ── Public-IP metrics strip (purpose-built: track the external IP) ──── -->
+    <section x-show="timelineKind === 'publicip'" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
-        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">Last response</div>
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">Current IP</div>
+        <div class="text-xl font-bold font-mono truncate"
+             :class="ipCurrent ? 'text-cyan-300' : 'text-amber-400'"
+             :title="ipCurrent || 'unreachable'"
+             x-text="ipCurrent || 'unreachable'"></div>
+      </div>
+      <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">Stable for</div>
+        <div class="text-xl font-bold text-slate-100" x-text="ipStableFor"></div>
+      </div>
+      <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1" x-text="'IP changes (' + activeWindow + ')'"></div>
+        <div class="text-xl font-bold"
+             :class="ipChanges > 0 ? 'text-amber-400' : 'text-slate-100'"
+             x-text="ipChanges.toLocaleString()"></div>
+      </div>
+      <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">Last check</div>
+        <div class="text-xl font-bold text-slate-100" x-text="lastCheckedAt ? formatRelative(lastCheckedAt) : '—'"></div>
+      </div>
+    </section>
+
+    <!-- ── Metrics strip (data-first) ─────────────────────────────────────── -->
+    <section x-show="timelineKind !== 'publicip'" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1" x-text="timelineKind === 'border' ? 'Upstream RTT' : 'Last response'"></div>
         <div class="text-xl font-bold text-slate-100" x-text="lastResponseMs != null ? lastResponseMs + ' ms' : '—'"></div>
       </div>
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
@@ -133,8 +169,9 @@
     <section class="bg-slate-900 border border-slate-700 rounded-xl p-6">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
-          Response Time <span class="text-slate-600" x-text="'· ' + activeWindow"></span>
-          <span x-show="chartMode === 'raw'" class="text-cyan-500/70 normal-case tracking-normal">(raw)</span>
+          <span x-text="timelineKind === 'publicip' ? 'Public IP' : (timelineKind === 'border' ? 'Border Status' : 'Response Time')"></span>
+          <span class="text-slate-600" x-text="'· ' + activeWindow"></span>
+          <span x-show="!timelineKind && chartMode === 'raw'" class="text-cyan-500/70 normal-case tracking-normal">(raw)</span>
           <span x-show="isLoadingDetail" class="text-slate-500 normal-case tracking-normal">
             <i class="fa-solid fa-circle-notch fa-spin"></i> updating…
           </span>
@@ -149,9 +186,20 @@
       </div>
       <div id="response-chart" class="echart"></div>
       <div x-show="!hasData && !isLoadingDetail" class="text-slate-500 text-sm py-6 text-center">No data in this window.</div>
-      <div x-show="lossCount > 0" class="mt-3 text-xs text-slate-500 flex items-center gap-2">
+      <!-- Response-time loss summary (line-chart monitors only) -->
+      <div x-show="!timelineKind && lossCount > 0" class="mt-3 text-xs text-slate-500 flex items-center gap-2">
         <span class="inline-block w-2.5 h-2.5 rounded-full bg-red-400"></span>
         <span x-text="(chartMode === 'raw' ? lossCount + ' lost probe' + (lossCount === 1 ? '' : 's') : lossCount + ' interval' + (lossCount === 1 ? '' : 's') + ' with loss') + ' in view'"></span>
+      </div>
+      <!-- State-timeline legend: each color's value (IP / fault class) and time in effect -->
+      <div x-show="timelineKind && tlLegend.length" class="mt-4 flex flex-wrap gap-x-5 gap-y-2 text-xs">
+        <template x-for="entry in tlLegend" :key="entry.label">
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-3 h-3 rounded-sm" :style="`background:${entry.color}`"></span>
+            <span class="text-slate-300" :class="timelineKind === 'publicip' ? 'font-mono' : ''" x-text="entry.label"></span>
+            <span class="text-slate-500" x-text="'· ' + fmtLegendDuration(entry.ms)"></span>
+          </div>
+        </template>
       </div>
     </section>
 

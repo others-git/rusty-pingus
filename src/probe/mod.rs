@@ -1,5 +1,7 @@
+pub mod border;
 pub mod http;
 pub mod icmp;
+pub mod publicip;
 pub mod tcp;
 
 use chrono::{DateTime, Utc};
@@ -13,6 +15,10 @@ pub struct ProbeResult {
     pub status: String,
     pub response_time_ms: Option<u64>,
     pub failure_reason: Option<String>,
+    /// Optional, human-readable type-specific context (e.g. a public-IP monitor's
+    /// observed address, or a border monitor's fault localization). Null for types
+    /// that record no extra context.
+    pub detail: Option<String>,
     pub checked_at: DateTime<Utc>,
 }
 
@@ -25,6 +31,7 @@ impl ProbeResult {
             status: "up".to_string(),
             response_time_ms: Some(response_time_ms),
             failure_reason: None,
+            detail: None,
             checked_at: Utc::now(),
         }
     }
@@ -37,7 +44,15 @@ impl ProbeResult {
             status: "down".to_string(),
             response_time_ms: None,
             failure_reason: Some(reason.to_string()),
+            detail: None,
             checked_at: Utc::now(),
         }
+    }
+
+    /// Attach type-specific detail context, consuming and returning self so it
+    /// chains off the `up`/`down` constructors.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 }

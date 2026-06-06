@@ -33,8 +33,8 @@ pub async fn init(path: &str) -> Result<SqlitePool> {
 
 pub async fn insert_result(pool: &SqlitePool, result: &ProbeResult) -> Result<()> {
     sqlx::query(
-        "INSERT INTO probe_results (monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, checked_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO probe_results (monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&result.monitor_name)
     .bind(&result.protocol)
@@ -42,6 +42,7 @@ pub async fn insert_result(pool: &SqlitePool, result: &ProbeResult) -> Result<()
     .bind(&result.status)
     .bind(result.response_time_ms.map(|v| v as i64))
     .bind(&result.failure_reason)
+    .bind(&result.detail)
     .bind(result.checked_at.to_rfc3339())
     .execute(pool)
     .await?;
@@ -56,6 +57,7 @@ pub struct CurrentStatus {
     pub status: String,
     pub response_time_ms: Option<i64>,
     pub failure_reason: Option<String>,
+    pub detail: Option<String>,
     pub checked_at: String,
 }
 
@@ -63,7 +65,7 @@ pub struct CurrentStatus {
 /// dashboard so its cost scales with the number of monitors, not total rows.
 pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<Option<CurrentStatus>> {
     let row = sqlx::query_as::<_, CurrentStatus>(
-        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, checked_at
+        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
          WHERE monitor_name = ?
          ORDER BY checked_at DESC
@@ -77,7 +79,7 @@ pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<
 
 pub async fn get_current_status(pool: &SqlitePool) -> Result<Vec<CurrentStatus>> {
     let rows = sqlx::query_as::<_, CurrentStatus>(
-        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, checked_at
+        "SELECT monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
          WHERE id IN (SELECT MAX(id) FROM probe_results GROUP BY monitor_name)
          ORDER BY monitor_name",
@@ -96,6 +98,7 @@ pub struct HistoryRow {
     pub status: String,
     pub response_time_ms: Option<i64>,
     pub failure_reason: Option<String>,
+    pub detail: Option<String>,
     pub checked_at: String,
 }
 
@@ -114,7 +117,7 @@ pub async fn get_history(
         .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string());
 
     let rows = sqlx::query_as::<_, HistoryRow>(
-        "SELECT id, monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, checked_at
+        "SELECT id, monitor_name, protocol, endpoint, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
          WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
          ORDER BY checked_at DESC

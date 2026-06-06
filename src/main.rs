@@ -132,12 +132,21 @@ async fn async_main(
         tracing::warn!("ICMP monitors configured but CAP_NET_RAW may be unavailable.");
     }
 
-    let state = AppState { pool: pool.clone(), monitors: monitor_store };
+    // Live status fan-out: the scheduler broadcasts a StatusUpdate after each
+    // probe; SSE clients (the dashboard) subscribe. Bounded — a lagging client
+    // drops oldest events and is reconciled by the dashboard's periodic poll.
+    let (updates_tx, _) = tokio::sync::broadcast::channel(256);
+
+    let state = AppState {
+        pool: pool.clone(),
+        monitors: monitor_store,
+        updates: updates_tx.clone(),
+    };
 
     let sched_handle = {
         let pool = pool.clone();
         let cancel = cancel.clone();
-        tokio::spawn(scheduler::run(initial_monitors, pool, cancel, monitor_rx))
+        tokio::spawn(scheduler::run(initial_monitors, pool, cancel, monitor_rx, updates_tx))
     };
 
     let web_handle = {

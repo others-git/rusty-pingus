@@ -1,20 +1,78 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     Json,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 
 use crate::db;
 use crate::monitors::{MonitorConfig, MonitorStore};
+use crate::probe::ProbeResult;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     pub monitors: MonitorStore,
+    /// In-process fan-out of live status updates to connected SSE clients.
+    pub updates: broadcast::Sender<StatusUpdate>,
+}
+
+// ── Live status updates (SSE) ─────────────────────────────────────────────────
+
+/// A lightweight, push-on-probe status payload. Built directly from a
+/// `ProbeResult` (no extra DB query) and broadcast to connected dashboards.
+#[derive(Clone, Debug, Serialize)]
+pub struct StatusUpdate {
+    pub name: String,
+    pub protocol: String,
+    pub endpoint: String,
+    pub status: String,
+    pub response_time_ms: Option<u64>,
+    pub failure_reason: Option<String>,
+    pub detail: Option<String>,
+    pub last_checked_at: String,
+}
+
+impl From<&ProbeResult> for StatusUpdate {
+    fn from(r: &ProbeResult) -> Self {
+        Self {
+            name: r.monitor_name.clone(),
+            protocol: r.protocol.clone(),
+            endpoint: r.endpoint.clone(),
+            status: r.status.clone(),
+            response_time_ms: r.response_time_ms,
+            failure_reason: r.failure_reason.clone(),
+            detail: r.detail.clone(),
+            last_checked_at: r.checked_at.to_rfc3339(),
+        }
+    }
+}
+
+/// `GET /api/monitors/stream` — Server-Sent Events stream of live status
+/// updates. Subscribes to the broadcast channel; lagged-subscriber errors are
+/// skipped (the dashboard's poll reconciles), and the stream ends when the
+/// client disconnects. `KeepAlive` keeps idle connections from timing out.
+pub async fn monitor_stream(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = state.updates.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|res| match res {
+        Ok(update) => Some(Ok(Event::default()
+            .json_data(&update)
+            .unwrap_or_else(|_| Event::default().comment("serialize error")))),
+        // Lagged: the client fell behind and missed events; skip, the poll reconciles.
+        Err(_) => None,
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // ── Existing read-only endpoints ──────────────────────────────────────────────
@@ -28,6 +86,7 @@ pub struct MonitorStatus {
     pub last_checked_at: Option<String>,
     pub response_time_ms: Option<i64>,
     pub failure_reason: Option<String>,
+    pub detail: Option<String>,
     pub uptime_24h: Option<f64>,
 }
 
@@ -51,6 +110,7 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
                     last_checked_at: Some(s.checked_at),
                     response_time_ms: s.response_time_ms,
                     failure_reason: s.failure_reason,
+                    detail: s.detail,
                     uptime_24h,
                 });
             }
@@ -63,6 +123,7 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
                     last_checked_at: None,
                     response_time_ms: None,
                     failure_reason: None,
+                    detail: None,
                     uptime_24h: None,
                 });
             }
@@ -247,7 +308,36 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
                 errors.push("host is required".into());
             }
         }
+        MonitorConfig::PublicIp(c) => {
+            // url is optional; if given it must be http(s).
+            if let Some(url) = &c.url {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    errors.push("url must be a valid http or https URL".into());
+                }
+            }
+        }
+        MonitorConfig::Border(c) => {
+            if let Some(gw) = &c.gateway {
+                if !is_valid_host(gw) {
+                    errors.push("gateway must be a valid IP or host".into());
+                }
+            }
+            if !is_valid_host(&c.upstream) {
+                errors.push("upstream must be a valid IP or host".into());
+            }
+        }
     }
 
     errors
+}
+
+/// A pragmatic IP-or-hostname check: a parseable IP, or a non-empty token with no
+/// whitespace/control characters and only host-legal characters.
+fn is_valid_host(s: &str) -> bool {
+    if s.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    !s.is_empty()
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':')
 }

@@ -1,0 +1,461 @@
+/* ============================================================================
+   THEMES — applied via <html data-theme="…">. "Default" = no attribute, zero
+   overrides (stock look untouched).
+
+   These are deliberately LOUD. Each theme reskins backgrounds (often animated +
+   cursor-reactive via --mx/--my/--mxpx/--mypx set by theme.js), card geometry,
+   typography, and decoration — not just colors.
+
+   Functional rule still holds: text sits on solid card backgrounds (legible),
+   status colors keep meaning (up=green, down=red, pending=amber), controls stay
+   clickable, layout flow intact. Decorative layers are fixed + pointer-events:none.
+   Pattern: base color on <html>, body transparent, animated layers on body::
+   before/::after at z-index:-1 (behind content, above the page base).
+   ============================================================================ */
+
+:root { --mx: 0.5; --my: 0.5; --mxpx: 50%; --mypx: 50%; }
+
+@keyframes ts-grid   { from { background-position: 0 0; }     to { background-position: 0 60px; } }
+@keyframes ts-flicker{ 0%,19%,21%,55%,57%,100% { opacity: 1; } 20%,56% { opacity: .35; } }
+@keyframes ts-bob    { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+@keyframes ts-spin   { to { transform: rotate(360deg); } }
+@keyframes ts-hue    { to { filter: hue-rotate(360deg); } }
+@keyframes ts-drift  { from { background-position: 0 0; } to { background-position: 1200px 0; } }
+@keyframes ts-textgrad { to { background-position: 200% center; } }
+@keyframes ts-glitch {
+  0%,100% { transform: translate(0); clip-path: inset(0 0 0 0); }
+  20% { transform: translate(-2px, 1px); clip-path: inset(0 0 60% 0); }
+  40% { transform: translate(2px, -1px); clip-path: inset(50% 0 0 0); }
+  60% { transform: translate(-1px, -1px); clip-path: inset(20% 0 40% 0); }
+  80% { transform: translate(1px, 1px); clip-path: inset(70% 0 10% 0); }
+}
+@keyframes ts-twinkle { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+
+/* Registered custom properties — lets us *animate* a gradient angle and a hue
+   (plain CSS vars can't be transitioned/animated; @property makes them typed). */
+@property --chaos-angle { syntax: "<angle>"; inherits: true; initial-value: 0deg; }
+@property --chaos-hue   { syntax: "<number>"; inherits: true; initial-value: 0; }
+@keyframes chaos-spin { to { --chaos-angle: 360deg; } }
+@keyframes chaos-hue  { to { --chaos-hue: 360; } }
+@keyframes chaos-blob {
+  0%,100% { border-radius: 16px 44px 20px 40px / 36px 18px 42px 16px; }
+  50%     { border-radius: 44px 16px 40px 20px / 18px 38px 16px 40px; }
+}
+@keyframes chaos-moire { to { transform: rotate(360deg) scale(1.25); } }
+@keyframes chaos-glow {
+  0%   { box-shadow: 0 0 24px #ff0044, inset 0 0 20px rgba(255,0,68,.20); }
+  50%  { box-shadow: 0 0 24px #00e5ff, inset 0 0 20px rgba(0,229,255,.20); }
+  100% { box-shadow: 0 0 24px #9dff00, inset 0 0 20px rgba(157,255,0,.20); }
+}
+@keyframes chaos-alarm {
+  0%,100% { box-shadow: 0 0 28px #ff003c; }
+  50%     { box-shadow: 0 0 64px #ff003c, 0 0 110px #ff003c; }
+}
+@keyframes chaos-shape-spin { to { rotate: 360deg; } }
+
+/* ╔═══════════════════════════════════════════════════════════════╗
+   ║  ⚡ CYBERPUNK — "NEON CITY"                                     ║
+   ╚═══════════════════════════════════════════════════════════════╝ */
+html[data-theme="cyber"] { background: #04040a !important; }
+html[data-theme="cyber"] body { background: transparent !important; }
+html[data-theme="cyber"] body,
+html[data-theme="cyber"] .font-sans { font-family: "Courier New", ui-monospace, monospace !important; letter-spacing: .02em; }
+/* animated neon grid + scanlines */
+html[data-theme="cyber"] body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .5;
+  background:
+    repeating-linear-gradient(0deg, rgba(0,240,255,.06) 0 2px, transparent 2px 4px),
+    linear-gradient(rgba(0,240,255,.10) 1px, transparent 1px) 0 0 / 44px 44px,
+    linear-gradient(90deg, rgba(255,43,214,.10) 1px, transparent 1px) 0 0 / 44px 44px;
+  animation: ts-grid 5s linear infinite;
+}
+/* cursor neon spotlight */
+html[data-theme="cyber"] body::after {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(420px circle at var(--mxpx) var(--mypx), rgba(255,43,214,.22), rgba(0,240,255,.10) 40%, transparent 60%),
+    radial-gradient(circle at 50% 50%, transparent 48%, rgba(0,0,0,.6));
+}
+html[data-theme="cyber"] .bg-slate-950 { background-color: transparent !important; }
+html[data-theme="cyber"] .bg-slate-900 { background-color: rgba(12,10,28,.85) !important; }
+html[data-theme="cyber"] .bg-slate-800 { background-color: rgba(18,15,40,.85) !important; }
+html[data-theme="cyber"] .text-slate-100 { color: #eafcff !important; }
+html[data-theme="cyber"] .text-slate-200 { color: #d6f7ff !important; }
+html[data-theme="cyber"] .text-slate-300 { color: #b6ecff !important; }
+html[data-theme="cyber"] .text-slate-400 { color: #7fb6e6 !important; }
+html[data-theme="cyber"] .text-slate-500 { color: #6470a8 !important; }
+html[data-theme="cyber"] .text-slate-600 { color: #495084 !important; }
+html[data-theme="cyber"] .text-slate-700 { color: #2c3160 !important; }
+html[data-theme="cyber"] .text-cyan-300 { color: #6ff6ff !important; }
+html[data-theme="cyber"] .text-cyan-400,
+html[data-theme="cyber"] .text-cyan-500 { color: #00f0ff !important; text-shadow: 0 0 8px #00f0ff !important; }
+html[data-theme="cyber"] .bg-cyan-600,
+html[data-theme="cyber"] .bg-cyan-500,
+html[data-theme="cyber"] .hover\:bg-cyan-500:hover { background-color: #ff2bd6 !important; box-shadow: 0 0 14px #ff2bd6 !important; }
+html[data-theme="cyber"] .border-slate-700 { border-color: rgba(0,240,255,.35) !important; }
+html[data-theme="cyber"] .text-emerald-400 { color: #2dff8f !important; text-shadow: 0 0 6px #2dff8f99 !important; }
+html[data-theme="cyber"] .text-red-400 { color: #ff3b6b !important; text-shadow: 0 0 6px #ff3b6b99 !important; }
+html[data-theme="cyber"] .text-amber-400 { color: #ffe14d !important; }
+/* notched tech panels */
+html[data-theme="cyber"] .rounded-xl {
+  border-radius: 0 !important;
+  border: 1px solid rgba(0,240,255,.4) !important;
+  box-shadow: 0 0 18px rgba(0,240,255,.12), inset 0 0 18px rgba(255,43,214,.06) !important;
+  clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px));
+}
+html[data-theme="cyber"] h2 { animation: ts-flicker 6s infinite steps(1); }
+
+/* ╔═══════════════════════════════════════════════════════════════╗
+   ║  ⚙ STEAMPUNK — "BRASS & STEAM"                                 ║
+   ╚═══════════════════════════════════════════════════════════════╝ */
+html[data-theme="steam"] { background: #e7d5af !important; }
+html[data-theme="steam"] body { background: transparent !important; }
+html[data-theme="steam"] body,
+html[data-theme="steam"] .font-sans { font-family: Georgia, "Times New Roman", serif !important; }
+/* rivet pattern + vignette + warm gaslight following cursor */
+html[data-theme="steam"] body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background:
+    radial-gradient(300px circle at var(--mxpx) var(--mypx), rgba(255,206,120,.25), transparent 55%),
+    radial-gradient(rgba(120,85,40,.18) 1.5px, transparent 1.6px) 0 0 / 26px 26px,
+    radial-gradient(circle at 50% 50%, transparent 55%, rgba(60,40,15,.30));
+}
+/* slow rotating gear, bottom-right */
+html[data-theme="steam"] body::after {
+  content: ""; position: fixed; right: -90px; bottom: -90px; width: 320px; height: 320px;
+  z-index: -1; pointer-events: none; opacity: .14;
+  background: conic-gradient(from 0deg, #5b3b16 0 14deg, transparent 14deg 30deg,
+    #5b3b16 30deg 44deg, transparent 44deg 60deg, #5b3b16 60deg 74deg, transparent 74deg 90deg,
+    #5b3b16 90deg 104deg, transparent 104deg 120deg);
+  border-radius: 50%; animation: ts-spin 40s linear infinite;
+}
+html[data-theme="steam"] .bg-slate-950 { background-color: transparent !important; }
+html[data-theme="steam"] .bg-slate-900 { background-color: #e2cfa3 !important; }
+html[data-theme="steam"] .bg-slate-800 { background-color: #f2e7cb !important; }
+html[data-theme="steam"] .text-slate-100 { color: #2b1d10 !important; }
+html[data-theme="steam"] .text-slate-200 { color: #3a2917 !important; }
+html[data-theme="steam"] .text-slate-300 { color: #4a3722 !important; }
+html[data-theme="steam"] .text-slate-400 { color: #6b5436 !important; }
+html[data-theme="steam"] .text-slate-500 { color: #836a45 !important; }
+html[data-theme="steam"] .text-slate-600 { color: #9c8763 !important; }
+html[data-theme="steam"] .text-slate-700 { color: #b29b73 !important; }
+html[data-theme="steam"] .text-cyan-300,
+html[data-theme="steam"] .text-cyan-400,
+html[data-theme="steam"] .text-cyan-500 { color: #9a5a12 !important; }
+html[data-theme="steam"] .bg-cyan-600,
+html[data-theme="steam"] .bg-cyan-500,
+html[data-theme="steam"] .hover\:bg-cyan-500:hover {
+  background: linear-gradient(#caa15a, #8a5a12) !important; color: #fff4dc !important;
+  box-shadow: inset 0 1px 0 #ffe7b0, 0 2px 4px rgba(60,40,15,.4) !important;
+}
+html[data-theme="steam"] .border-slate-700 { border-color: #a9824a !important; }
+html[data-theme="steam"] .text-emerald-400 { color: #4a7a32 !important; }
+html[data-theme="steam"] .text-red-400 { color: #9a3320 !important; }
+html[data-theme="steam"] .text-amber-400 { color: #9a7416 !important; }
+/* riveted brass plates, slightly askew */
+html[data-theme="steam"] .rounded-xl {
+  border: 4px double #a9824a !important;
+  border-radius: 10px !important;
+  box-shadow: inset 0 0 0 2px rgba(255,231,176,.4), 0 6px 16px rgba(60,40,15,.35) !important;
+  transform: rotate(-0.5deg);
+}
+
+/* ╔═══════════════════════════════════════════════════════════════╗
+   ║  🌻 SOLARPUNK — "SUNFLOWER"                                    ║
+   ╚═══════════════════════════════════════════════════════════════╝ */
+html[data-theme="solar"] { background: linear-gradient(#fdfbe9, #e7f6d6) fixed !important; }
+html[data-theme="solar"] body { background: transparent !important; }
+html[data-theme="solar"] body,
+html[data-theme="solar"] .font-sans { font-family: "Trebuchet MS", "Inter", sans-serif !important; }
+/* warm sun glow following the cursor */
+html[data-theme="solar"] body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: radial-gradient(360px circle at var(--mxpx) var(--mypx), rgba(255,209,102,.45), rgba(255,209,102,.10) 45%, transparent 65%);
+}
+/* drifting clouds */
+html[data-theme="solar"] body::after {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .5;
+  background-image:
+    radial-gradient(120px 50px at 20% 22%, #fff 60%, transparent 62%),
+    radial-gradient(160px 60px at 70% 30%, #fff 60%, transparent 62%),
+    radial-gradient(100px 44px at 45% 60%, #fff 60%, transparent 62%);
+  background-repeat: repeat-x; background-size: 1200px 100%;
+  animation: ts-drift 60s linear infinite;
+}
+html[data-theme="solar"] .bg-slate-950 { background-color: transparent !important; }
+html[data-theme="solar"] .bg-slate-900 { background-color: rgba(238,246,221,.85) !important; }
+html[data-theme="solar"] .bg-slate-800 { background-color: #ffffff !important; }
+html[data-theme="solar"] .text-slate-100 { color: #1f3d1a !important; }
+html[data-theme="solar"] .text-slate-200 { color: #244a1f !important; }
+html[data-theme="solar"] .text-slate-300 { color: #2f5e28 !important; }
+html[data-theme="solar"] .text-slate-400 { color: #4a7a3e !important; }
+html[data-theme="solar"] .text-slate-500 { color: #6b8f5a !important; }
+html[data-theme="solar"] .text-slate-600 { color: #8aa877 !important; }
+html[data-theme="solar"] .text-slate-700 { color: #a9c498 !important; }
+html[data-theme="solar"] .text-cyan-300,
+html[data-theme="solar"] .text-cyan-400,
+html[data-theme="solar"] .text-cyan-500 { color: #2f9e44 !important; }
+html[data-theme="solar"] .bg-cyan-600,
+html[data-theme="solar"] .bg-cyan-500,
+html[data-theme="solar"] .hover\:bg-cyan-500:hover { background-color: #f59f00 !important; color: #1f3d1a !important; }
+html[data-theme="solar"] .border-slate-700 { border-color: #c2dca6 !important; }
+html[data-theme="solar"] .text-emerald-400 { color: #2f9e44 !important; }
+html[data-theme="solar"] .text-red-400 { color: #d6453b !important; }
+html[data-theme="solar"] .text-amber-400 { color: #e8a300 !important; }
+/* organic, blobby, gently bobbing cards */
+html[data-theme="solar"] .rounded-xl {
+  border-radius: 30px 60px 32px 54px / 54px 30px 60px 30px !important;
+  border: 2px solid #bcdca0 !important;
+  box-shadow: 0 12px 28px rgba(47,158,68,.18) !important;
+  animation: ts-bob 7s ease-in-out infinite;
+}
+html[data-theme="solar"] .rounded-lg { border-radius: 16px 22px 16px 22px !important; }
+
+/* ╔═══════════════════════════════════════════════════════════════╗
+   ║  🌴 VAPORWAVE — "A E S T H E T I C"                            ║
+   ╚═══════════════════════════════════════════════════════════════╝ */
+html[data-theme="vapor"] {
+  background:
+    radial-gradient(2px 2px at 12% 18%, #fff, transparent),
+    radial-gradient(1.5px 1.5px at 28% 9%, #fff, transparent),
+    radial-gradient(1.5px 1.5px at 45% 22%, #ffd1f7, transparent),
+    radial-gradient(2px 2px at 67% 12%, #fff, transparent),
+    radial-gradient(1.5px 1.5px at 82% 26%, #cdefff, transparent),
+    radial-gradient(2px 2px at 91% 8%, #fff, transparent),
+    linear-gradient(160deg, #2a0a4a 0%, #5b1d8f 45%, #0e7c8c 100%) !important;
+  background-attachment: fixed !important;
+}
+html[data-theme="vapor"] body { background: transparent !important; }
+html[data-theme="vapor"] body,
+html[data-theme="vapor"] .font-sans { font-family: "Comic Sans MS", "Comic Sans", "Chalkboard SE", cursive !important; }
+/* retro perspective grid floor (parallax to cursor) */
+html[data-theme="vapor"] body::before {
+  content: ""; position: fixed; left: -50%; right: -50%; bottom: -8%; height: 62%;
+  z-index: -1; pointer-events: none; opacity: .7;
+  background-image:
+    linear-gradient(rgba(0,245,212,.6) 2px, transparent 2px),
+    linear-gradient(90deg, rgba(255,46,151,.6) 2px, transparent 2px);
+  background-size: 64px 64px;
+  transform: perspective(320px) rotateX(72deg) translateX(calc((var(--mx) - 0.5) * -70px));
+  transform-origin: bottom center;
+  animation: ts-grid 3.5s linear infinite;
+}
+/* striped retro sun (parallax to cursor) */
+html[data-theme="vapor"] body::after {
+  content: ""; position: fixed; top: 7%; left: 50%; width: 280px; height: 280px; margin-left: -140px;
+  z-index: -1; pointer-events: none; border-radius: 50%;
+  background: linear-gradient(#fff3a0, #ff2e97 58%, #b5179e);
+  -webkit-mask-image: repeating-linear-gradient(#000 0 9px, transparent 9px 14px);
+  mask-image: repeating-linear-gradient(#000 0 9px, transparent 9px 14px);
+  filter: drop-shadow(0 0 50px rgba(255,46,151,.6));
+  transform: translateX(calc((var(--mx) - 0.5) * 40px)) translateY(calc((var(--my) - 0.5) * -20px));
+}
+html[data-theme="vapor"] .bg-slate-950 { background-color: transparent !important; }
+html[data-theme="vapor"] .bg-slate-900 { background-color: rgba(45,20,78,.78) !important; backdrop-filter: blur(2px); }
+html[data-theme="vapor"] .bg-slate-800 { background-color: rgba(58,26,102,.74) !important; }
+html[data-theme="vapor"] .text-slate-100 { color: #fdf0ff !important; }
+html[data-theme="vapor"] .text-slate-200 { color: #ffe0fb !important; }
+html[data-theme="vapor"] .text-slate-300 { color: #ffc8f3 !important; }
+html[data-theme="vapor"] .text-slate-400 { color: #ff9fe6 !important; }
+html[data-theme="vapor"] .text-slate-500 { color: #c0a3ee !important; }
+html[data-theme="vapor"] .text-slate-600 { color: #9b81d0 !important; }
+html[data-theme="vapor"] .text-slate-700 { color: #6b5a9c !important; }
+html[data-theme="vapor"] .text-cyan-300,
+html[data-theme="vapor"] .text-cyan-400,
+html[data-theme="vapor"] .text-cyan-500 { color: #00f5d4 !important; }
+html[data-theme="vapor"] .bg-cyan-600,
+html[data-theme="vapor"] .bg-cyan-500,
+html[data-theme="vapor"] .hover\:bg-cyan-500:hover { background-color: #ff2e97 !important; }
+html[data-theme="vapor"] .border-slate-700 { border-color: rgba(0,245,212,.5) !important; }
+html[data-theme="vapor"] .text-emerald-400 { color: #2bffb3 !important; }
+html[data-theme="vapor"] .text-red-400 { color: #ff4d6d !important; }
+html[data-theme="vapor"] .text-amber-400 { color: #ffd23f !important; }
+/* neon cards with chunky offset shadow, tilted */
+html[data-theme="vapor"] .rounded-xl {
+  border: 2px solid #00f5d4 !important;
+  border-radius: 4px !important;
+  box-shadow: 8px 8px 0 #ff2e97, -2px -2px 0 rgba(0,245,212,.6) !important;
+  transform: rotate(-1deg);
+}
+/* loud title treatment (headings only — keep metric numbers legible) */
+html[data-theme="vapor"] h1, html[data-theme="vapor"] h2 {
+  letter-spacing: .14em !important;
+  text-shadow: 2px 2px 0 #ff2e97, 4px 4px 0 #00f5d4 !important;
+  animation: ts-hue 12s linear infinite;
+}
+
+/* ╔═══════════════════════════════════════════════════════════════╗
+   ║  🌀 CHAOS — "ENTROPY"   (all fashion, minimal function)         ║
+   ║  Showcase: @property-animated conic gradients, SVG feTurbulence ║
+   ║  displacement (#chaos-warp via theme.js), mix-blend-mode,       ║
+   ║  cursor-driven rotate3d, morphing blobs, :has(), color-mix().   ║
+   ╚═══════════════════════════════════════════════════════════════╝ */
+/* dark void base — no rainbow; the geometry is the show */
+html[data-theme="chaos"] {
+  background: radial-gradient(120% 90% at 50% 12%, #15071f 0%, #08070f 55%, #050509 100%) fixed !important;
+  cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><path d="M14 1 L27 26 L1 26 Z" fill="none" stroke="%239dff00" stroke-width="2"/></svg>') 14 26, crosshair;
+}
+html[data-theme="chaos"] body { background: transparent !important; }
+html[data-theme="chaos"] body,
+html[data-theme="chaos"] .font-sans { font-family: "Courier New", ui-monospace, monospace !important; }
+
+/* randomized geometric shapes (seeded by theme.js) that PARALLAX to the cursor
+   via individual transform properties — translate from --mx/--my, rotate spins */
+#chaos-shapes { display: none; }
+html[data-theme="chaos"] #chaos-shapes {
+  display: block; position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none;
+}
+html[data-theme="chaos"] .chaos-shape {
+  position: absolute;
+  translate: calc((var(--mx) - 0.5) * var(--px)) calc((var(--my) - 0.5) * var(--py));
+  animation: chaos-shape-spin var(--spin, 18s) linear infinite;
+  will-change: translate, rotate;
+}
+/* warping mono moiré (feTurbulence + difference) — texture, not color */
+html[data-theme="chaos"] body::before {
+  content: ""; position: fixed; inset: -50%; z-index: -1; pointer-events: none;
+  background: repeating-conic-gradient(from 0deg, #000 0 6deg, #fff 6deg 12deg);
+  mix-blend-mode: difference; opacity: .10;
+  filter: url(#chaos-warp);
+  animation: chaos-moire 30s linear infinite;
+}
+/* stark acid spotlight that chases the cursor (single hue, screen blend) */
+html[data-theme="chaos"] body::after {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: radial-gradient(480px circle at var(--mxpx) var(--mypx), rgba(157,255,0,.14), transparent 62%);
+  mix-blend-mode: screen;
+}
+/* translucent glass so text survives over the maelstrom */
+html[data-theme="chaos"] .bg-slate-950 { background-color: transparent !important; }
+html[data-theme="chaos"] .bg-slate-900 { background-color: rgba(7,6,13,.72) !important; backdrop-filter: blur(6px); }
+html[data-theme="chaos"] .bg-slate-800 { background-color: rgba(11,9,20,.64) !important; backdrop-filter: blur(6px); }
+html[data-theme="chaos"] .text-slate-100,
+html[data-theme="chaos"] .text-slate-200,
+html[data-theme="chaos"] .text-slate-300 { color: #f3f5ff !important; text-shadow: 0 0 6px #000; }
+html[data-theme="chaos"] .text-slate-400 { color: #b9c2e6 !important; text-shadow: 0 0 6px #000; }
+html[data-theme="chaos"] .text-slate-500 { color: #8a93bf !important; }
+html[data-theme="chaos"] .text-slate-600 { color: #69708f !important; }
+html[data-theme="chaos"] .text-slate-700 { color: #474d68 !important; }
+html[data-theme="chaos"] .text-cyan-300,
+html[data-theme="chaos"] .text-cyan-400,
+html[data-theme="chaos"] .text-cyan-500 { color: #00e5ff !important; text-shadow: 0 0 10px #00e5ff99; }
+/* stark neon buttons */
+html[data-theme="chaos"] .bg-cyan-600,
+html[data-theme="chaos"] .bg-cyan-500,
+html[data-theme="chaos"] .hover\:bg-cyan-500:hover {
+  background: #0a0612 !important; color: #9dff00 !important; font-weight: 700;
+  border: 1px solid #9dff00 !important; box-shadow: 0 0 14px rgba(157,255,0,.4) !important;
+}
+/* color-mix() border (two electric stops, not a rainbow) */
+html[data-theme="chaos"] .border-slate-700 { border-color: color-mix(in oklch, #9dff00, #ff0044) !important; }
+html[data-theme="chaos"] .text-emerald-400 { color: #9dff00 !important; text-shadow: 0 0 10px #9dff0099; }
+html[data-theme="chaos"] .text-red-400 { color: #ff0044 !important; text-shadow: 0 0 10px #ff004499; }
+html[data-theme="chaos"] .text-amber-400 { color: #ffb300 !important; text-shadow: 0 0 10px #ffb30099; }
+/* cards: morphing blobs that tilt in 3D toward the cursor, electric glow */
+html[data-theme="chaos"] .rounded-xl {
+  border: 1px solid color-mix(in oklch, #9dff00, #ff0044) !important;
+  border-radius: 16px 44px 20px 40px / 36px 18px 42px 16px !important;
+  transform: perspective(900px)
+    rotateY(calc((var(--mx) - .5) * 16deg))
+    rotateX(calc((var(--my) - .5) * -16deg));
+  transform-style: preserve-3d;
+  animation: chaos-blob 11s ease-in-out infinite, chaos-glow 7s linear infinite;
+}
+/* :has() — a card containing a DOWN status physically alarms */
+html[data-theme="chaos"] .rounded-xl:has(.text-red-400) {
+  animation: chaos-blob 11s ease-in-out infinite, chaos-alarm 1s steps(2) infinite !important;
+  border-color: #ff0044 !important;
+}
+/* warped, glitch-aberration headings (no rainbow) */
+html[data-theme="chaos"] h2 {
+  filter: url(#chaos-warp);
+  color: #f3f5ff !important;
+  text-shadow: 2px 0 #ff0044, -2px 0 #00e5ff, 0 0 8px rgba(157,255,0,.4) !important;
+  letter-spacing: .14em !important;
+}
+html[data-theme="chaos"] ::selection { background: #9dff00; color: #07060d; }
+html[data-theme="chaos"] ::-webkit-scrollbar-track { background: #07060d; }
+html[data-theme="chaos"] ::-webkit-scrollbar-thumb { background: linear-gradient(#9dff00, #ff0044); }
+
+/* ╔═══════════════════════════════════════════════════════════════╗
+   ║  EXTRA DRAMA — custom cursors, selection, scrollbars, hover,    ║
+   ║  gradient/glitch headings (shared, per-theme)                   ║
+   ╚═══════════════════════════════════════════════════════════════╝ */
+
+/* Smooth card interactions for every theme. */
+html[data-theme] .rounded-xl { transition: transform .2s ease, box-shadow .2s ease; }
+
+/* ── Custom cursors (vector for cyber; emoji + fallback for the rest) ─────── */
+html[data-theme="cyber"], html[data-theme="cyber"] * {
+  cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M12 1V23M1 12H23" stroke="%2300f0ff" stroke-width="2"/><circle cx="12" cy="12" r="4" fill="none" stroke="%23ff2bd6" stroke-width="1.5"/></svg>') 12 12, crosshair;
+}
+html[data-theme="steam"] {
+  cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><text x="2" y="22" font-size="22">⚙</text></svg>') 6 22, auto;
+}
+html[data-theme="solar"] {
+  cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30"><text x="2" y="24" font-size="24">🌻</text></svg>') 6 26, auto;
+}
+html[data-theme="vapor"] {
+  cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><text x="2" y="22" font-size="22">✨</text></svg>') 6 22, auto;
+}
+
+/* ── Text selection ──────────────────────────────────────────────────────── */
+html[data-theme="cyber"] ::selection { background: #ff2bd6; color: #04040a; }
+html[data-theme="steam"] ::selection { background: #a9824a; color: #fff4dc; }
+html[data-theme="solar"] ::selection { background: #f59f00; color: #1f3d1a; }
+html[data-theme="vapor"] ::selection { background: #00f5d4; color: #2a0a4a; }
+
+/* ── Themed scrollbars (WebKit/Chromium) ─────────────────────────────────── */
+html[data-theme] ::-webkit-scrollbar { width: 14px; height: 14px; }
+html[data-theme="cyber"] ::-webkit-scrollbar-track { background: #04040a; }
+html[data-theme="cyber"] ::-webkit-scrollbar-thumb { background: linear-gradient(#ff2bd6, #00f0ff); border-radius: 0; }
+html[data-theme="steam"] ::-webkit-scrollbar-track { background: #e2cfa3; }
+html[data-theme="steam"] ::-webkit-scrollbar-thumb { background: linear-gradient(#caa15a, #8a5a12); border: 1px solid #5b3b16; }
+html[data-theme="solar"] ::-webkit-scrollbar-track { background: #e7f6d6; }
+html[data-theme="solar"] ::-webkit-scrollbar-thumb { background: #f59f00; border-radius: 10px; }
+html[data-theme="vapor"] ::-webkit-scrollbar-track { background: #2a0a4a; }
+html[data-theme="vapor"] ::-webkit-scrollbar-thumb { background: linear-gradient(#ff2e97, #00f5d4); border-radius: 8px; }
+
+/* ── Card hover: lift + amplify (composes over each theme's base transform) ─ */
+html[data-theme="cyber"] .rounded-xl:hover {
+  transform: translateY(-4px) scale(1.015);
+  box-shadow: 0 0 30px rgba(0,240,255,.55), 0 0 60px rgba(255,43,214,.35) !important;
+}
+html[data-theme="steam"] .rounded-xl:hover {
+  transform: rotate(0deg) scale(1.02);
+  box-shadow: inset 0 0 0 2px rgba(255,231,176,.5), 0 12px 26px rgba(60,40,15,.5) !important;
+}
+html[data-theme="solar"] .rounded-xl:hover {
+  transform: translateY(-8px) scale(1.02);
+  box-shadow: 0 22px 44px rgba(47,158,68,.3) !important;
+}
+html[data-theme="vapor"] .rounded-xl:hover {
+  transform: rotate(0deg) translateY(-5px);
+  box-shadow: 14px 14px 0 #ff2e97, -4px -4px 0 #00f5d4 !important;
+}
+
+/* ── Heading flourishes (h2 only — protects metric numbers) ──────────────── */
+html[data-theme="solar"] h2 {
+  background: linear-gradient(90deg, #2f9e44, #f59f00, #2f9e44);
+  background-size: 200% auto;
+  -webkit-background-clip: text; background-clip: text; color: transparent !important;
+  animation: ts-textgrad 5s linear infinite;
+}
+html[data-theme="vapor"] h2 {
+  background: linear-gradient(90deg, #00f5d4, #ff2e97, #ffd23f, #00f5d4);
+  background-size: 300% auto;
+  -webkit-background-clip: text; background-clip: text; color: transparent !important;
+  text-shadow: none !important;
+  animation: ts-textgrad 4s linear infinite;
+}
+html[data-theme="cyber"] h2:hover { animation: ts-glitch .4s steps(2) infinite; }
+
+/* ── Respect reduced-motion: keep the looks, drop the motion ──────────────── */
+@media (prefers-reduced-motion: reduce) {
+  html[data-theme],
+  html[data-theme] body::before,
+  html[data-theme] body::after,
+  html[data-theme] .rounded-xl,
+  html[data-theme] h1, html[data-theme] h2 { animation: none !important; }
+  html[data-theme] .rounded-xl:hover { transform: none !important; }
+}

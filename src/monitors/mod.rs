@@ -36,6 +36,22 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # name = "gateway"
 # host = "1.1.1.1"
 # interval_ms = 30000
+# count = 3  # echo requests per cycle; up if any reply (default 3, min 1)
+
+# Public-IP monitor example (tracks your external IP, flags changes):
+# [[monitors]]
+# protocol = "publicip"
+# name = "my-public-ip"
+# interval_ms = 300000
+# url = "https://checkip.amazonaws.com"  # optional; default has a built-in fallback
+
+# Border monitor example (localizes LAN vs ISP faults; requires ICMP privileges):
+# [[monitors]]
+# protocol = "border"
+# name = "home-border"
+# interval_ms = 30000
+# gateway = "192.168.1.1"  # optional; auto-detected when omitted
+# upstream = "1.1.1.1"      # upstream reference (default 1.1.1.1)
 "#;
 
 // ── Monitor config types ──────────────────────────────────────────────────────
@@ -46,7 +62,16 @@ pub enum MonitorConfig {
     Http(HttpMonitorConfig),
     Tcp(TcpMonitorConfig),
     Icmp(IcmpMonitorConfig),
+    #[serde(rename = "publicip")]
+    PublicIp(PublicIpMonitorConfig),
+    Border(BorderMonitorConfig),
 }
+
+/// Default service for the public-IP monitor; `icanhazip.com` is the fallback.
+pub const DEFAULT_PUBLICIP_URL: &str = "https://checkip.amazonaws.com";
+pub const FALLBACK_PUBLICIP_URL: &str = "https://icanhazip.com";
+/// Default upstream reference for the border monitor.
+pub const DEFAULT_BORDER_UPSTREAM: &str = "1.1.1.1";
 
 impl MonitorConfig {
     pub fn name(&self) -> &str {
@@ -54,6 +79,8 @@ impl MonitorConfig {
             Self::Http(c) => &c.name,
             Self::Tcp(c) => &c.name,
             Self::Icmp(c) => &c.name,
+            Self::PublicIp(c) => &c.name,
+            Self::Border(c) => &c.name,
         }
     }
 
@@ -62,6 +89,8 @@ impl MonitorConfig {
             Self::Http(c) => c.interval_ms,
             Self::Tcp(c) => c.interval_ms,
             Self::Icmp(c) => c.interval_ms,
+            Self::PublicIp(c) => c.interval_ms,
+            Self::Border(c) => c.interval_ms,
         }
     }
 
@@ -70,6 +99,8 @@ impl MonitorConfig {
             Self::Http(_) => "http",
             Self::Tcp(_) => "tcp",
             Self::Icmp(_) => "icmp",
+            Self::PublicIp(_) => "publicip",
+            Self::Border(_) => "border",
         }
     }
 
@@ -79,6 +110,12 @@ impl MonitorConfig {
             Self::Http(c) => c.url.clone(),
             Self::Tcp(c) => format!("{}:{}", c.host, c.port),
             Self::Icmp(c) => c.host.clone(),
+            Self::PublicIp(c) => c.url.clone().unwrap_or_else(|| DEFAULT_PUBLICIP_URL.to_string()),
+            Self::Border(c) => format!(
+                "{} → {}",
+                c.gateway.clone().unwrap_or_else(|| "auto".to_string()),
+                c.upstream
+            ),
         }
     }
 }
@@ -116,10 +153,40 @@ pub struct IcmpMonitorConfig {
     pub host: String,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    /// Number of ICMP echo requests sent per probe cycle. The monitor is up if
+    /// at least one reply is received; defaults to 3, clamped to a minimum of 1.
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawPublicIpMonitorConfig")]
+pub struct PublicIpMonitorConfig {
+    pub name: String,
+    /// IP-echo service to query. Defaults to [`DEFAULT_PUBLICIP_URL`] with
+    /// [`FALLBACK_PUBLICIP_URL`] as a backup when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "RawBorderMonitorConfig")]
+pub struct BorderMonitorConfig {
+    pub name: String,
+    /// Local gateway to probe. Auto-detected when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// Upstream reference, defaulting to [`DEFAULT_BORDER_UPSTREAM`].
+    pub upstream: String,
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
 }
 
 pub fn default_interval_ms() -> u64 { 60_000 }
 pub fn default_timeout_ms() -> u64 { 10_000 }
+fn default_icmp_count() -> u32 { 3 }
+fn default_border_upstream() -> String { DEFAULT_BORDER_UPSTREAM.to_string() }
 fn default_http_method() -> String { "GET".to_string() }
 
 // ── Backward-compatible deserialization ───────────────────────────────────────
@@ -191,6 +258,7 @@ struct RawIcmpMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default)] count: Option<u32>,
 }
 
 impl From<RawIcmpMonitorConfig> for IcmpMonitorConfig {
@@ -198,6 +266,55 @@ impl From<RawIcmpMonitorConfig> for IcmpMonitorConfig {
         Self {
             name: r.name,
             host: r.host,
+            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
+            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+            count: r.count.unwrap_or_else(default_icmp_count).max(1),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawPublicIpMonitorConfig {
+    name: String,
+    #[serde(default)] url: Option<String>,
+    #[serde(default)] interval_ms: Option<u64>,
+    #[serde(default)] interval_secs: Option<u64>,
+    #[serde(default)] timeout_ms: Option<u64>,
+    #[serde(default)] timeout_secs: Option<u64>,
+}
+
+impl From<RawPublicIpMonitorConfig> for PublicIpMonitorConfig {
+    fn from(r: RawPublicIpMonitorConfig) -> Self {
+        Self {
+            name: r.name,
+            // Treat an empty URL as unset so the default/fallback applies.
+            url: r.url.filter(|u| !u.trim().is_empty()),
+            interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
+            timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawBorderMonitorConfig {
+    name: String,
+    #[serde(default)] gateway: Option<String>,
+    #[serde(default)] upstream: Option<String>,
+    #[serde(default)] interval_ms: Option<u64>,
+    #[serde(default)] interval_secs: Option<u64>,
+    #[serde(default)] timeout_ms: Option<u64>,
+    #[serde(default)] timeout_secs: Option<u64>,
+}
+
+impl From<RawBorderMonitorConfig> for BorderMonitorConfig {
+    fn from(r: RawBorderMonitorConfig) -> Self {
+        Self {
+            name: r.name,
+            gateway: r.gateway.filter(|g| !g.trim().is_empty()),
+            upstream: r
+                .upstream
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(default_border_upstream),
             interval_ms: resolve_ms(r.interval_ms, r.interval_secs, default_interval_ms()),
             timeout_ms: resolve_ms(r.timeout_ms, r.timeout_secs, default_timeout_ms()),
         }
@@ -343,6 +460,14 @@ pub fn apply_defaults(monitors: &mut Vec<MonitorConfig>, defaults: &Defaults) {
                 if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
                 if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
             }
+            MonitorConfig::PublicIp(c) => {
+                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
+                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
+            }
+            MonitorConfig::Border(c) => {
+                if let Some(t) = timeout { if c.timeout_ms == default_timeout_ms() { c.timeout_ms = t; } }
+                if let Some(i) = interval { if c.interval_ms == default_interval_ms() { c.interval_ms = i; } }
+            }
         }
     }
 }
@@ -404,4 +529,41 @@ fn strip_monitors_from_toml(input: &str) -> String {
     let mut result = output.join("\n");
     if !result.ends_with('\n') { result.push('\n'); }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_icmp(toml_body: &str) -> IcmpMonitorConfig {
+        let file: MonitorsFile = toml::from_str(toml_body).expect("valid TOML");
+        match file.monitors.into_iter().next().expect("one monitor") {
+            MonitorConfig::Icmp(c) => c,
+            other => panic!("expected ICMP monitor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn icmp_count_defaults_to_three_when_missing() {
+        let c = parse_icmp(
+            "[[monitors]]\nprotocol = \"icmp\"\nname = \"gw\"\nhost = \"1.1.1.1\"\n",
+        );
+        assert_eq!(c.count, 3);
+    }
+
+    #[test]
+    fn icmp_count_zero_is_clamped_to_one() {
+        let c = parse_icmp(
+            "[[monitors]]\nprotocol = \"icmp\"\nname = \"gw\"\nhost = \"1.1.1.1\"\ncount = 0\n",
+        );
+        assert_eq!(c.count, 1);
+    }
+
+    #[test]
+    fn icmp_count_explicit_value_is_respected() {
+        let c = parse_icmp(
+            "[[monitors]]\nprotocol = \"icmp\"\nname = \"gw\"\nhost = \"1.1.1.1\"\ncount = 5\n",
+        );
+        assert_eq!(c.count, 5);
+    }
 }

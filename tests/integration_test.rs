@@ -81,6 +81,36 @@ async fn tcp_probe_down_stored_in_db() {
 }
 
 #[tokio::test]
+async fn detail_round_trips_through_insert_and_history() {
+    let (pool, _dir) = open_temp_db().await;
+
+    // An up result carrying type-specific detail (e.g. a public-IP reading).
+    let mut with = probe::ProbeResult::up("ip-mon", "publicip", "https://checkip.amazonaws.com", 12)
+        .with_detail("203.0.113.7");
+    // A plain result with no detail, recorded a minute earlier so ordering is stable.
+    let mut without = probe::ProbeResult::up("ip-mon", "publicip", "https://checkip.amazonaws.com", 9);
+    without.checked_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+    with.checked_at = chrono::Utc::now();
+    db::insert_result(&pool, &without).await.expect("insert without");
+    db::insert_result(&pool, &with).await.expect("insert with");
+
+    let history = db::get_history(&pool, "ip-mon", None, None, 10)
+        .await
+        .expect("get_history");
+    assert_eq!(history.len(), 2);
+    // Newest first: the detail-bearing row round-trips its value.
+    assert_eq!(history[0].detail.as_deref(), Some("203.0.113.7"));
+    assert_eq!(history[1].detail, None);
+
+    // Current status also carries the latest detail.
+    let latest = db::get_latest_status(&pool, "ip-mon")
+        .await
+        .expect("get_latest_status")
+        .expect("a row");
+    assert_eq!(latest.detail.as_deref(), Some("203.0.113.7"));
+}
+
+#[tokio::test]
 async fn uptime_calculation_correct() {
     let (pool, _dir) = open_temp_db().await;
 
@@ -93,6 +123,7 @@ async fn uptime_calculation_correct() {
             status: if i < 3 { "up" } else { "down" }.into(),
             response_time_ms: if i < 3 { Some(10) } else { None },
             failure_reason: if i < 3 { None } else { Some("timeout".into()) },
+            detail: None,
             checked_at: chrono::Utc::now()
                 - chrono::Duration::seconds((3 - i as i64) * 10),
         };
@@ -120,6 +151,7 @@ async fn history_query_returns_ordered_results() {
             status: "up".into(),
             response_time_ms: Some((i * 10) as u64),
             failure_reason: None,
+            detail: None,
             checked_at: chrono::Utc::now() - chrono::Duration::seconds(i * 60),
         };
         db::insert_result(&pool, &r).await.expect("insert");
@@ -151,6 +183,7 @@ async fn series_buckets_are_bounded_and_aggregated() {
             status: if up { "up" } else { "down" }.into(),
             response_time_ms: if up { Some((10 + i) as u64) } else { None },
             failure_reason: if up { None } else { Some("timeout".into()) },
+            detail: None,
             checked_at: now - chrono::Duration::minutes((19 - i) * 3),
         };
         db::insert_result(&pool, &r).await.expect("insert");
@@ -203,6 +236,7 @@ async fn rollups_back_series_and_uptime() {
                 status: if rt.is_some() { "up" } else { "down" }.into(),
                 response_time_ms: *rt,
                 failure_reason: if rt.is_some() { None } else { Some("timeout".into()) },
+                detail: None,
                 checked_at: base + chrono::Duration::seconds(i as i64), // same minute
             };
             db::insert_result(&pool, &r).await.expect("insert");

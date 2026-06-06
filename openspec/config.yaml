@@ -1,5 +1,11 @@
 schema: spec-driven
 
+context: |
+  each monitor type should have a page that matches it's purpose.
+  Tech stack:
+  - Apache ECharts
+  - Rust
+
 # Project context (optional)
 # This is shown to AI when creating artifacts.
 # Add your tech stack, conventions, style guides, domain knowledge, etc.
@@ -18,3 +24,7 @@ schema: spec-driven
 #       - Always include a "Non-goals" section
 #     tasks:
 #       - Break tasks into chunks of max 2 hours
+
+rules:
+  all:
+    - after changing any source file, git commit.
