@@ -23,7 +23,7 @@
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3/dist/cdn.min.js"></script>
   <!-- Apache ECharts: built-in dataZoom (wheel/drag/slider) + markArea for downtime; pinned. -->
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
-  <script>try{var t=localStorage.getItem('theme');if(t&&t!=='default')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>
+  <script>try{var t=localStorage.getItem('theme');document.documentElement.setAttribute('data-theme',(t&&t!=='default')?t:'cyber');}catch(e){document.documentElement.setAttribute('data-theme','cyber');}</script>
   <link rel="stylesheet" href="/style.css" />
   <link rel="stylesheet" href="/themes.css" />
   <script defer src="/theme.js"></script>

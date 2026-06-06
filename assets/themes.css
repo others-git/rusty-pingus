@@ -60,21 +60,36 @@ html[data-theme="cyber"] { background: #04040a !important; }
 html[data-theme="cyber"] body { background: transparent !important; }
 html[data-theme="cyber"] body,
 html[data-theme="cyber"] .font-sans { font-family: "Courier New", ui-monospace, monospace !important; letter-spacing: .02em; }
-/* animated neon grid + scanlines */
-html[data-theme="cyber"] body::before {
-  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .5;
-  background:
-    repeating-linear-gradient(0deg, rgba(0,240,255,.06) 0 2px, transparent 2px 4px),
-    linear-gradient(rgba(0,240,255,.10) 1px, transparent 1px) 0 0 / 44px 44px,
-    linear-gradient(90deg, rgba(255,43,214,.10) 1px, transparent 1px) 0 0 / 44px 44px;
-  animation: ts-grid 5s linear infinite;
+/* Animated aurora wash: a slow cyan→magenta→violet→blue gradient that drifts on
+   its own (no cursor input). Sits furthest back; the static grid layer is above. */
+@keyframes ts-aurora {
+  0%   { background-position: 0% 50%; }
+  25%  { background-position: 50% 0%; }
+  50%  { background-position: 100% 50%; }
+  75%  { background-position: 50% 100%; }
+  100% { background-position: 0% 50%; }
 }
-/* cursor neon spotlight */
+html[data-theme="cyber"] body::before {
+  content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none;
+  background: linear-gradient(125deg,
+    #060417 0%, #0b0730 16%, #1b0a44 32%, #36105e 46%,
+    #0c2150 62%, #102a6a 76%, #071a3e 88%, #060417 100%);
+  background-size: 320% 320%;
+  filter: saturate(1.15);
+  animation: ts-aurora 34s ease-in-out infinite;
+}
+/* Static faint grid + scanlines + vignette for structure over the moving wash. */
 html[data-theme="cyber"] body::after {
-  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .6;
   background:
-    radial-gradient(420px circle at var(--mxpx) var(--mypx), rgba(255,43,214,.22), rgba(0,240,255,.10) 40%, transparent 60%),
-    radial-gradient(circle at 50% 50%, transparent 48%, rgba(0,0,0,.6));
+    repeating-linear-gradient(0deg, rgba(0,240,255,.05) 0 2px, transparent 2px 4px),
+    linear-gradient(rgba(0,240,255,.08) 1px, transparent 1px) 0 0 / 46px 46px,
+    linear-gradient(90deg, rgba(255,43,214,.08) 1px, transparent 1px) 0 0 / 46px 46px,
+    radial-gradient(circle at 50% 38%, transparent 55%, rgba(0,0,0,.55));
+}
+/* Respect reduced-motion: hold the aurora at a static position. */
+@media (prefers-reduced-motion: reduce) {
+  html[data-theme="cyber"] body::before { animation: none; background-position: 50% 50%; }
 }
 html[data-theme="cyber"] .bg-slate-950 { background-color: transparent !important; }
 html[data-theme="cyber"] .bg-slate-900 { background-color: rgba(12,10,28,.85) !important; }
@@ -385,10 +400,8 @@ html[data-theme="chaos"] ::-webkit-scrollbar-thumb { background: linear-gradient
 /* Smooth card interactions for every theme. */
 html[data-theme] .rounded-xl { transition: transform .2s ease, box-shadow .2s ease; }
 
-/* ── Custom cursors (vector for cyber; emoji + fallback for the rest) ─────── */
-html[data-theme="cyber"], html[data-theme="cyber"] * {
-  cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><path d="M12 1V23M1 12H23" stroke="%2300f0ff" stroke-width="2"/><circle cx="12" cy="12" r="4" fill="none" stroke="%23ff2bd6" stroke-width="1.5"/></svg>') 12 12, crosshair;
-}
+/* ── Custom cursors (emoji + fallback per theme; the default/cyber keeps the
+      normal system cursor) ──────────────────────────────────────────────── */
 html[data-theme="steam"] {
   cursor: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><text x="2" y="22" font-size="22">⚙</text></svg>') 6 22, auto;
 }

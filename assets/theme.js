@@ -3,8 +3,9 @@
 // theming is done by themes.css via the `data-theme` attribute on <html>.
 (function () {
   const KEY = 'theme';
+  // Cyberpunk is the default; there is no plain "Default" theme.
+  const DEFAULT_THEME = 'cyber';
   const THEMES = [
-    { id: 'default', name: 'Default' },
     { id: 'cyber',   name: '⚡ Cyberpunk — NEON CITY' },
     { id: 'steam',   name: '⚙ Steampunk — BRASS & STEAM' },
     { id: 'solar',   name: '🌻 Solarpunk — SUNFLOWER' },
@@ -75,11 +76,14 @@
     document.body.appendChild(wrap);
   }
 
-  const current = () => { try { return localStorage.getItem(KEY) || 'default'; } catch (e) { return 'default'; } };
+  // Resolve a stored value to a real theme: nothing stored, or the removed legacy
+  // "default", both map to the cyberpunk default.
+  const normalize = (id) => (!id || id === 'default') ? DEFAULT_THEME : id;
+  const current = () => { try { return normalize(localStorage.getItem(KEY)); } catch (e) { return DEFAULT_THEME; } };
   const save = (id) => { try { localStorage.setItem(KEY, id); } catch (e) {} };
   function apply(id) {
-    if (id && id !== 'default') document.documentElement.setAttribute('data-theme', id);
-    else document.documentElement.removeAttribute('data-theme');
+    // Every theme (including the cyberpunk default) is applied via the attribute.
+    document.documentElement.setAttribute('data-theme', normalize(id));
   }
 
   function build() {
