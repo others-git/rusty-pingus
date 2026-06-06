@@ -82,20 +82,14 @@
                'border-l-4 border-l-amber-500': m.enabled && (!m.status || m.status === 'pending')
              }">
 
-          <!-- Enable/disable toggle + Delete (shown on hover) -->
-          <button @click.stop="toggleMonitor(m)"
-                  class="absolute top-3 right-9 opacity-0 group-hover:opacity-100 transition-opacity text-slate-500 hover:text-cyan-400 p-1 rounded"
-                  :title="m.enabled ? 'Pause monitor' : 'Resume monitor'">
-            <i class="fa-solid text-xs" :class="m.enabled ? 'fa-pause' : 'fa-play'"></i>
-          </button>
-          <button @click.stop="pendingDelete = m.name"
-                  class="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity text-slate-500 hover:text-red-400 p-1 rounded"
-                  title="Delete monitor">
-            <i class="fa-solid fa-trash text-xs"></i>
-          </button>
+          <!-- Whole-tile link (stretched overlay). Interactive controls below sit
+               above it (z-10) so they stay clickable without navigating. -->
+          <a :href="'/monitors/' + encodeURIComponent(m.name)"
+             :aria-label="'View ' + m.name"
+             class="absolute inset-0 z-0 rounded-xl"></a>
 
-          <!-- Clickable area -->
-          <a :href="'/monitors/' + encodeURIComponent(m.name)" class="block no-underline text-inherit">
+          <!-- Content -->
+          <div class="relative pointer-events-none">
             <div class="flex items-center gap-3 mb-3">
               <span class="text-cyan-400 text-sm w-5 text-center">
                 <i :class="protocolIcon(m.protocol)"></i>
@@ -151,7 +145,21 @@
               </span>
             </div>
             <div class="text-xs text-slate-600" x-text="m.last_checked_at ? 'Checked ' + formatRelative(m.last_checked_at) : 'Not yet checked'"></div>
-          </a>
+          </div>
+
+          <!-- Controls (hover-revealed), bottom-right, above the tile link -->
+          <div class="absolute bottom-3 right-3 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button @click.stop="toggleMonitor(m)"
+                    class="text-slate-500 hover:text-cyan-400 p-1 rounded"
+                    :title="m.enabled ? 'Pause monitor' : 'Resume monitor'">
+              <i class="fa-solid text-xs" :class="m.enabled ? 'fa-pause' : 'fa-play'"></i>
+            </button>
+            <button @click.stop="pendingDelete = m.name"
+                    class="text-slate-500 hover:text-red-400 p-1 rounded"
+                    title="Delete monitor">
+              <i class="fa-solid fa-trash text-xs"></i>
+            </button>
+          </div>
         </div>
       </template>
     </div>

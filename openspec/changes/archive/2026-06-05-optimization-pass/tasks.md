@@ -36,4 +36,4 @@
 - [x] 6.3 Dashboard list now issues a fixed 2 queries (`get_current_status` + `get_uptime_24h_all`) regardless of monitor count (was 2N).
 - [x] 6.4 `EXPLAIN QUERY PLAN` confirms uptime + series use `idx_probe_results_monitor_covering` (index-only) over the integer `checked_at`.
 - [~] 6.5 Backend verified live (HTTP monitor: live update + history/series/uptime + relative times). Full browser-visual pass of the timeline/traceroute detail views not done here (no browser); JS syntax-checked, data paths confirmed.
-- [ ] 6.6 Sync the `result-storage` main spec via this change's delta at archive time.
+- [x] 6.6 Sync the `result-storage` main spec via this change's delta at archive time.

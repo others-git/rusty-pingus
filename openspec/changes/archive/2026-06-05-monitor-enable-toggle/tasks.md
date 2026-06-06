@@ -30,4 +30,4 @@
 - [x] 5.2 Create a monitor, disable it via the API: confirm probing stops (no new probe rows) and the config persists `enabled = false`; re-enable and confirm probing resumes — all without restarting.
 - [x] 5.3 Confirm an existing `monitors.toml` without `enabled` keys loads all monitors as enabled.
 - [~] 5.4 Confirm the dashboard shows the toggle and renders a disabled monitor as paused (distinct from down), reflecting state from the list.
-- [ ] 5.5 Sync the `monitor-config`, `scheduler`, `monitor-crud-api`, and `web-ui` main specs via this change's deltas at archive time.
+- [x] 5.5 Sync the `monitor-config`, `scheduler`, `monitor-crud-api`, and `web-ui` main specs via this change's deltas at archive time.
