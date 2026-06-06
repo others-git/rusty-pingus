@@ -104,8 +104,74 @@
       </div>
     </section>
 
+    <!-- ── Traceroute view (per-hop latency waterfall) ────────────────────── -->
+    <template x-if="isTraceroute">
+      <div class="flex flex-col gap-6">
+        <!-- Time-range brush over the retained data -->
+        <section class="bg-slate-800 border border-slate-700 rounded-xl p-5">
+          <div class="flex items-center justify-between mb-3">
+            <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
+              <span>Time range</span>
+              <span x-show="traceLoading" class="text-slate-500 normal-case tracking-normal">
+                <i class="fa-solid fa-circle-notch fa-spin"></i> updating…
+              </span>
+            </h2>
+            <span class="text-xs text-slate-500" x-text="traceRangeLabel()"></span>
+          </div>
+          <div id="trace-brush" class="w-full" style="height: 72px;"></div>
+          <p class="text-slate-600 text-xs mt-1">Drag the handles to refine the range; min/avg/max below recompute over it.</p>
+        </section>
+
+        <!-- Per-hop table with relative-latency bars -->
+        <section class="bg-slate-900 border border-slate-700 rounded-xl p-6">
+          <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-4 flex items-center gap-2">
+            <span>Path</span>
+            <span class="text-slate-600" x-text="detail || ''"></span>
+          </h2>
+          <div x-show="!hasData && !traceLoading" class="text-slate-500 text-sm py-6 text-center">No traceroute data in this range.</div>
+          <div x-show="hasData" class="overflow-x-auto">
+            <!-- Fixed row height (h-9 = 36px) keeps the latency graph's category
+                 bands aligned with the table rows; the graph lives in one cell
+                 that spans all body rows. -->
+            <table class="w-full text-sm border-collapse table-fixed">
+              <thead>
+                <tr class="text-slate-500 text-xs uppercase tracking-wide border-b border-slate-700 h-9">
+                  <th class="text-left font-medium pr-3 w-10">#</th>
+                  <th class="text-left font-medium pr-3 w-40">Address</th>
+                  <th class="text-right font-medium pr-3 w-20">Avg</th>
+                  <th class="text-right font-medium pr-3 w-20">Min</th>
+                  <th class="text-right font-medium pr-3 w-20">Max</th>
+                  <th class="text-left font-medium pl-3">Latency</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="(h, i) in traceHops" :key="h.hop_no">
+                  <tr class="border-b border-slate-800/60 h-9">
+                    <td class="pr-3 text-slate-400 font-mono" x-text="h.hop_no"></td>
+                    <td class="pr-3 font-mono truncate"
+                        :class="h.reachable ? 'text-cyan-300' : 'text-slate-600'"
+                        :title="h.reachable ? (h.addr || '') : 'no reply'"
+                        x-text="h.reachable ? (h.addr || '—') : '* (no reply)'"></td>
+                    <td class="pr-3 text-right text-slate-100" x-text="traceFmtMs(h.avg_ms)"></td>
+                    <td class="pr-3 text-right text-slate-400" x-text="traceFmtMs(h.min_ms)"></td>
+                    <td class="pr-3 text-right text-slate-400" x-text="traceFmtMs(h.max_ms)"></td>
+                    <!-- The latency graph spans all body rows from the first row's cell -->
+                    <template x-if="i === 0">
+                      <td :rowspan="traceHops.length" class="pl-3 align-top p-0">
+                        <div id="hop-chart" class="w-full h-full" style="min-height: 36px;"></div>
+                      </td>
+                    </template>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </template>
+
     <!-- ── Metrics strip (data-first) ─────────────────────────────────────── -->
-    <section x-show="timelineKind !== 'publicip'" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <section x-show="timelineKind !== 'publicip' && !isTraceroute" class="grid grid-cols-2 sm:grid-cols-4 gap-3">
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
         <div class="text-xs text-slate-500 uppercase tracking-wide mb-1" x-text="timelineKind === 'border' ? 'Upstream RTT' : 'Last response'"></div>
         <div class="text-xl font-bold text-slate-100" x-text="lastResponseMs != null ? lastResponseMs + ' ms' : '—'"></div>
@@ -132,7 +198,7 @@
     </section>
 
     <!-- ── Uptime windows (clickable selectors that set the chart range) ──── -->
-    <section class="bg-slate-800 border border-slate-700 rounded-xl p-5">
+    <section x-show="!isTraceroute" class="bg-slate-800 border border-slate-700 rounded-xl p-5">
       <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-4">Uptime — click to set chart range</h2>
       <div class="flex flex-wrap gap-6 justify-around">
         <template x-for="w in uptimeWindows" :key="w.label">
@@ -167,7 +233,7 @@
     </section>
 
     <!-- ── Response time chart (primary) ──────────────────────────────────── -->
-    <section class="bg-slate-900 border border-slate-700 rounded-xl p-6">
+    <section x-show="!isTraceroute" class="bg-slate-900 border border-slate-700 rounded-xl p-6">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
           <span x-text="timelineKind === 'publicip' ? 'Public IP' : (timelineKind === 'border' ? 'Border Status' : 'Response Time')"></span>

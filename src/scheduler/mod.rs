@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::StatusUpdate;
-use crate::monitors::MonitorConfig;
+use crate::monitors::{MonitorConfig, MonitorStore};
 use crate::db;
 use crate::probe;
 
@@ -128,6 +128,18 @@ async fn run_probe(
         MonitorConfig::Icmp(cfg) => probe::icmp::run(cfg).await,
         MonitorConfig::PublicIp(cfg) => probe::publicip::run(cfg, pool).await,
         MonitorConfig::Border(cfg) => probe::border::run(cfg).await,
+        MonitorConfig::Traceroute(cfg) => {
+            // Traceroute yields both a dashboard summary and per-hop data. Persist
+            // the hop data to the dedicated tables; the summary goes to probe_results
+            // below like every other monitor.
+            let (summary, run) = probe::traceroute::run(cfg).await;
+            if let Some(run) = run {
+                if let Err(e) = db::insert_traceroute(pool, &summary.monitor_name, summary.checked_at, &run).await {
+                    warn!(monitor = %summary.monitor_name, error = %e, "Failed to persist traceroute run");
+                }
+            }
+            summary
+        }
     };
     if let Err(e) = db::insert_result(pool, &result).await {
         warn!(error = %e, "Failed to persist probe result");
@@ -151,6 +163,31 @@ pub async fn retention_loop(pool: SqlitePool, retention_days: u64, cancel: Cance
                 }
                 if let Err(e) = db::prune_old_rollups(&pool, retention_days).await {
                     error!(error = %e, "Rollup retention cleanup failed");
+                }
+            }
+            _ = cancel.cancelled() => break,
+        }
+    }
+}
+
+/// Prune traceroute data per its own monitor-configured retention. Runs on a
+/// fixed cadence, reading the current monitor list so added/removed monitors are
+/// picked up without restart.
+pub async fn traceroute_retention_loop(pool: SqlitePool, monitors: MonitorStore, cancel: CancellationToken) {
+    info!("Traceroute retention loop started");
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                for m in monitors.list().await {
+                    if let MonitorConfig::Traceroute(cfg) = m {
+                        match db::prune_traceroute(&pool, &cfg.name, cfg.retention_ms).await {
+                            Ok(n) if n > 0 => info!(monitor = %cfg.name, deleted = n, "Pruned old traceroute runs"),
+                            Ok(_) => {}
+                            Err(e) => error!(monitor = %cfg.name, error = %e, "Traceroute prune failed"),
+                        }
+                    }
                 }
             }
             _ = cancel.cancelled() => break,

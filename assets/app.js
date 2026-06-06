@@ -21,6 +21,9 @@ function dashboard() {
       expected_status: null,
       gateway: '',
       upstream: '1.1.1.1',
+      max_hops: 30,
+      queries_per_hop: 3,
+      retention_hours: 24,
       interval_ms: 60000,
       timeout_ms: 10000,
     },
@@ -115,6 +118,12 @@ function dashboard() {
       } else if (this.form.protocol === 'border') {
         if (this.form.gateway && this.form.gateway.trim()) body.gateway = this.form.gateway.trim();
         body.upstream = (this.form.upstream && this.form.upstream.trim()) || '1.1.1.1';
+      } else if (this.form.protocol === 'traceroute') {
+        body.host = this.form.host;
+        body.max_hops = this.form.max_hops;
+        body.queries_per_hop = this.form.queries_per_hop;
+        // UI collects retention in hours; the API stores milliseconds.
+        body.retention_ms = Math.max(1, Math.round((this.form.retention_hours || 24) * 3600 * 1000));
       } else {
         body.host = this.form.host;
         if (this.form.protocol === 'tcp') body.port = this.form.port;
@@ -192,12 +201,13 @@ function dashboard() {
         icmp: 'fa-solid fa-satellite-dish',
         publicip: 'fa-solid fa-location-crosshairs',
         border: 'fa-solid fa-shield-halved',
+        traceroute: 'fa-solid fa-route',
       };
       return icons[protocol] || 'fa-solid fa-circle-question';
     },
 
     protocolLabel(protocol) {
-      const labels = { publicip: 'Public IP', border: 'Border' };
+      const labels = { publicip: 'Public IP', border: 'Border', traceroute: 'Trace' };
       return labels[protocol] || protocol.toUpperCase();
     },
 

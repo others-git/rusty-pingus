@@ -33,6 +33,12 @@ function monitorDetail() {
   let eventSource = null;
   let liveRefreshTimer = null;
   let pollTimer = null;
+  // Traceroute view: the brush ECharts instance is kept OUT of Alpine (circular
+  // refs), like the main chart. `traceTimer` debounces brush-driven reloads.
+  let traceBrush = null;
+  let traceTimer = null;
+  let traceApplying = false; // guard: programmatic brush setOption must not refetch
+  let hopChart = null;       // the per-hop latency graph (min–max band + avg line)
 
   return {
     monitorName: decodeURIComponent(location.pathname.replace(/^\/monitors\//, '')),
@@ -55,6 +61,12 @@ function monitorDetail() {
     ipStableFor: '—',    // how long the current IP has held (in this window)
     ipChanges: 0,        // number of IP changes within the window
     ipDistinct: 0,       // distinct IPs seen in the window
+    // Traceroute view (protocol === 'traceroute').
+    isTraceroute: false,
+    traceHops: [],       // [{ hop_no, addr, reachable, min_ms, avg_ms, max_ms, loss, samples }]
+    traceLoading: false,
+    traceFrom: null, traceTo: null,              // ms; the active (brushed) range
+    traceExtentFrom: null, traceExtentTo: null,  // ms; retained-data bounds
     uptimeWindows: [
       { label: '1h',  key: 'uptime_1h',  value: null },
       { label: '24h', key: 'uptime_24h', value: null },
@@ -87,9 +99,14 @@ function monitorDetail() {
       if (latest) this._bumpServerNow(latest.checked_at);
       const proto = latest ? latest.protocol : null;
       this.timelineKind = (proto === 'publicip' || proto === 'border') ? proto : '';
+      this.isTraceroute = proto === 'traceroute';
 
       this.loading = false;
-      this.$nextTick(() => this.selectWindow(this.activeWindow));
+      if (this.isTraceroute) {
+        this.$nextTick(() => this._initTraceroute());
+      } else {
+        this.$nextTick(() => this.selectWindow(this.activeWindow));
+      }
 
       // Stay current as probes arrive (matches the dashboard): subscribe to the
       // live stream, fall back to polling, and tear down on navigation.
@@ -148,6 +165,13 @@ function monitorDetail() {
     // (suppresses per-probe flashing). Response-time monitors always refresh.
     _onLiveUpdate(u) {
       this._applyLiveStatus(u);
+      if (this.isTraceroute) {
+        // Header updates live; the hop table re-aggregates only when the brush is
+        // parked at the live edge (viewing "now"), so a parked historical view is
+        // left undisturbed.
+        this._scheduleTraceLive();
+        return;
+      }
       if (this.timelineKind) {
         const incoming = extractState({ detail: u.detail ?? '' });
         if (incoming !== lastTimelineValue) this._scheduleLiveRefresh();
@@ -210,6 +234,7 @@ function monitorDetail() {
       if (eventSource) { eventSource.close(); eventSource = null; }
       this._stopPoll();
       if (liveRefreshTimer) { clearTimeout(liveRefreshTimer); liveRefreshTimer = null; }
+      if (traceTimer) { clearTimeout(traceTimer); traceTimer = null; }
     },
 
     // Select a window: it fixes the chart's time axis and loads the window's data.
@@ -539,6 +564,210 @@ function monitorDetail() {
     resetZoom() {
       // Back to the full active window (also reloads it at window resolution).
       this.selectWindow(this.activeWindow);
+    },
+
+    // ── Traceroute view ───────────────────────────────────────────────────────
+    // A traceroute monitor shows a per-hop table (latency waterfall) over a
+    // brush-selected time range within its retained data, not the line/timeline
+    // chart or the fixed uptime windows.
+    async _initTraceroute() {
+      await this._loadTraceExtent();
+      const now = this._anchorMs();
+      this.traceExtentTo = this.traceExtentTo ?? now;
+      this.traceExtentFrom = this.traceExtentFrom ?? (this.traceExtentTo - 3_600_000);
+      this.traceFrom = this.traceExtentFrom;
+      this.traceTo = this.traceExtentTo;
+      await this._loadTraceHops();
+      this.$nextTick(() => this._renderBrush());
+    },
+
+    async _loadTraceExtent() {
+      const name = encodeURIComponent(this.monitorName);
+      try {
+        const ext = await (await fetch(`/api/monitors/${name}/traceroute/extent`)).json();
+        this.traceExtentFrom = ext.from ? Date.parse(ext.from) : null;
+        this.traceExtentTo = ext.to ? Date.parse(ext.to) : null;
+      } catch (e) { /* no data yet; bounds stay null */ }
+    },
+
+    // Fetch per-hop aggregates for the active [traceFrom, traceTo] range and
+    // compute the bar-scaling maximum (the slowest hop avg in view).
+    async _loadTraceHops() {
+      if (this.traceFrom == null || this.traceTo == null) return;
+      const name = encodeURIComponent(this.monitorName);
+      const fromIso = new Date(this.traceFrom).toISOString();
+      const toIso = new Date(this.traceTo).toISOString();
+      this.traceLoading = true;
+      try {
+        const hops = await (await fetch(
+          `/api/monitors/${name}/traceroute?from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`
+        )).json();
+        this.traceHops = Array.isArray(hops) ? hops : [];
+        this.hasData = this.traceHops.length > 0;
+        // Re-render the latency graph once the table rows (which set its height
+        // via the spanning cell) have been laid out.
+        this.$nextTick(() => this._renderHopChart());
+      } catch (e) {
+        this.traceHops = []; this.hasData = false;
+      } finally {
+        this.traceLoading = false;
+      }
+    },
+
+    // The resizable brush: an ECharts time slider spanning the retained extent.
+    // Moving/resizing it sets the active range and re-aggregates the table.
+    _renderBrush() {
+      const el = document.getElementById('trace-brush');
+      if (!el || !window.echarts) return;
+      const self = this;
+      const lo = this.traceExtentFrom ?? (this._anchorMs() - 3_600_000);
+      const hi = this.traceExtentTo ?? this._anchorMs();
+      const clamp = (x) => Math.max(0, Math.min(100, x));
+      const span = Math.max(1, hi - lo);
+
+      if (!traceBrush) {
+        traceBrush = echarts.init(el);
+        window.addEventListener('resize', () => traceBrush && traceBrush.resize());
+        traceBrush.on('datazoom', () => {
+          if (traceApplying) return; // programmatic update, not a user gesture
+          const dz = (traceBrush.getOption().dataZoom || [])[0] || {};
+          const lo2 = self.traceExtentFrom ?? lo;
+          const hi2 = self.traceExtentTo ?? hi;
+          const span2 = Math.max(1, hi2 - lo2);
+          self.traceFrom = lo2 + span2 * ((dz.start ?? 0) / 100);
+          self.traceTo = lo2 + span2 * ((dz.end ?? 100) / 100);
+          if (traceTimer) clearTimeout(traceTimer);
+          traceTimer = setTimeout(() => self._loadTraceHops(), 300);
+        });
+      }
+
+      const startPct = clamp(((this.traceFrom - lo) / span) * 100);
+      const endPct = clamp(((this.traceTo - lo) / span) * 100);
+      traceApplying = true;
+      traceBrush.setOption({
+        backgroundColor: 'transparent',
+        grid: { left: 8, right: 8, top: 6, bottom: 26 },
+        xAxis: {
+          type: 'time', min: lo, max: hi,
+          axisLine: { lineStyle: { color: '#334155' } },
+          axisLabel: { color: '#64748b', fontSize: 10, hideOverlap: true },
+          splitLine: { show: false },
+        },
+        yAxis: { type: 'value', show: false, min: 0, max: 1 },
+        dataZoom: [
+          { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
+          { type: 'slider', xAxisIndex: 0, filterMode: 'none', height: 18, bottom: 2,
+            start: startPct, end: endPct,
+            borderColor: '#334155', fillerColor: 'rgba(34,211,238,0.15)',
+            dataBackground: { lineStyle: { color: '#334155' }, areaStyle: { color: '#1e293b' } },
+            textStyle: { color: '#64748b' }, handleStyle: { color: '#22d3ee' } },
+        ],
+        series: [{
+          type: 'line', showSymbol: false, lineStyle: { width: 0 },
+          areaStyle: { color: 'rgba(34,211,238,0.08)' }, data: [[lo, 1], [hi, 1]],
+        }],
+      }, { notMerge: false });
+      traceApplying = false;
+    },
+
+    // On a live probe: advance the extent, and if the brush is parked at the live
+    // edge, slide it to "now" and refresh — otherwise leave a historical view be.
+    _scheduleTraceLive() {
+      const now = this._anchorMs();
+      const live = this.traceTo == null || this.traceExtentTo == null
+        || this.traceTo >= this.traceExtentTo - 1000;
+      this.traceExtentTo = Math.max(this.traceExtentTo ?? now, now);
+      if (this.traceExtentFrom == null) this.traceExtentFrom = now;
+      if (!live) return;
+      this.traceTo = this.traceExtentTo;
+      if (traceTimer) clearTimeout(traceTimer);
+      traceTimer = setTimeout(() => { this._loadTraceHops(); this._renderBrush(); }, 1000);
+    },
+
+    // The latency graph: one chart aligned to the hop rows. Each hop is a
+    // category (top→bottom), the value axis is latency; per hop a horizontal
+    // min–max band is drawn and the averages are connected by a line with dots.
+    // The chart fills a table cell that spans all body rows, so its category
+    // bands line up with the rows.
+    _renderHopChart() {
+      const el = document.getElementById('hop-chart');
+      if (!el || !window.echarts) return;
+      const hops = this.traceHops;
+      if (!hops.length) return;
+      // A %-height div inside a <td> collapses to content height, so size the
+      // chart element explicitly to the spanning cell (whose height the sibling
+      // rows fix). This is also what aligns the category bands to the rows.
+      const td = el.parentElement;
+      if (td && td.clientHeight) el.style.height = td.clientHeight + 'px';
+      // If Alpine recreated the cell element, rebind to the live node.
+      if (hopChart && hopChart.getDom() !== el) { hopChart.dispose(); hopChart = null; }
+      if (!hopChart) {
+        hopChart = echarts.init(el);
+        window.addEventListener('resize', () => { if (hopChart) hopChart.resize(); });
+      } else {
+        hopChart.resize(); // the spanning cell's height changes with hop count
+      }
+
+      let maxX = 0;
+      for (const h of hops) { const v = h.max_ms ?? h.avg_ms ?? 0; if (v > maxX) maxX = v; }
+      maxX = maxX > 0 ? maxX * 1.1 : 1;
+
+      const cats = hops.map(h => String(h.hop_no));
+      const bandData = hops.map((h, i) => [h.min_ms, h.max_ms, i]);
+      const avgData = hops.map(h => h.avg_ms ?? null);
+      const fmt = (v) => v == null ? '—' : (v < 10 ? v.toFixed(2) : Math.round(v).toLocaleString()) + ' ms';
+
+      hopChart.setOption({
+        backgroundColor: 'transparent',
+        grid: { top: 0, bottom: 0, left: 8, right: 14 },
+        tooltip: {
+          trigger: 'axis', axisPointer: { type: 'shadow' },
+          backgroundColor: '#1e293b', borderColor: '#334155', textStyle: { color: '#f1f5f9' },
+          formatter: (ps) => {
+            const i = ps[0].dataIndex; const h = hops[i];
+            return `<b>hop ${h.hop_no}</b> ${h.addr || '*'}<br/>`
+              + `avg ${fmt(h.avg_ms)}<br/>min ${fmt(h.min_ms)} · max ${fmt(h.max_ms)}`;
+          },
+        },
+        xAxis: { type: 'value', min: 0, max: maxX, show: false },
+        yAxis: {
+          type: 'category', inverse: true, data: cats, boundaryGap: true,
+          show: false, axisLine: { show: false }, axisTick: { show: false },
+        },
+        series: [
+          {
+            type: 'custom', z: 1, encode: { x: [0, 1], y: 2 }, data: bandData,
+            renderItem: (params, api) => {
+              const min = api.value(0), max = api.value(1), idx = api.value(2);
+              if (min == null || max == null || isNaN(min) || isNaN(max)) return;
+              const p1 = api.coord([min, idx]);
+              const p2 = api.coord([max, idx]);
+              const h = 7;
+              return {
+                type: 'rect',
+                shape: { x: p1[0], y: p1[1] - h / 2, width: Math.max(2, p2[0] - p1[0]), height: h, r: 3 },
+                style: { fill: 'rgba(34,211,238,0.22)' },
+              };
+            },
+          },
+          {
+            type: 'line', z: 2, data: avgData, connectNulls: false,
+            symbol: 'circle', symbolSize: 8, showSymbol: true,
+            lineStyle: { color: '#22d3ee', width: 2 }, itemStyle: { color: '#22d3ee' },
+          },
+        ],
+      }, { notMerge: true });
+      hopChart.resize();
+    },
+    traceFmtMs(v) {
+      if (v == null) return '—';
+      return (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString()) + ' ms';
+    },
+    traceRangeLabel() {
+      if (this.traceFrom == null || this.traceTo == null) return '';
+      const f = new Date(this.traceFrom).toLocaleString();
+      const t = new Date(this.traceTo).toLocaleString();
+      return `${f} → ${t}`;
     },
 
     // SVG gauge helpers
