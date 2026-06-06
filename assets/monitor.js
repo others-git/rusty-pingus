@@ -4,6 +4,8 @@ function monitorDetail() {
   const RAW_LIMIT = 1000;   // max raw probes to render individually
   const BUCKET_TARGET = 300;
   const REFETCH_DEBOUNCE_MS = 300;
+  const LIVE_REFRESH_DEBOUNCE_MS = 1000; // coalesce a burst of fast probes into one reload
+  const POLL_MS = 30_000;                // fallback cadence while SSE is unavailable
   const SUSTAINED_MS = 60_000; // outages >= this are drawn as a fat labeled band
 
   // ── Non-reactive state (closure) ──────────────────────────────────────────
@@ -16,10 +18,21 @@ function monitorDetail() {
   let tlSegments = [];      // state timeline: [{ state, label, start, end, color }, ...]
   const tlColorMap = new Map(); // stable value → color across re-renders/zoom (publicip)
   let windowFrom = null, windowTo = null; // ms; the fixed axis extent (active window)
+  // Anchor for all data-range math: the newest server-recorded probe time (ms).
+  // Probe rows are stamped on the SERVER clock; the browser clock can differ
+  // (WSL2 host/guest drift was observed ~4h40m). Building windows from the
+  // server's data time keeps ranged queries inside the data regardless of skew.
+  let serverNowMs = null;   // null until first data → _anchorMs() falls back to Date.now()
+  let lastTimelineValue = null; // last rendered state-timeline value (IP / fault class)
   let refetchSeq = 0;
   let debounceTimer = null;
   let isApplying = false;   // guard: programmatic setOption/dispatch must not refetch
   let resizeBound = false;
+  // Live updates: kept OUT of Alpine's reactive object (like the dashboard) — a
+  // proxied EventSource is a known footgun.
+  let eventSource = null;
+  let liveRefreshTimer = null;
+  let pollTimer = null;
 
   return {
     monitorName: decodeURIComponent(location.pathname.replace(/^\/monitors\//, '')),
@@ -64,23 +77,146 @@ function monitorDetail() {
       for (const w of this.uptimeWindows) w.value = uptime[w.key] ?? null;
       this.uptime24h = uptime.uptime_24h ?? null;
 
-      const latest = history[0];
+      const latest = history[0]; // history is newest-first
       this.currentStatus = latest ? latest.status : 'pending';
       this.lastResponseMs = latest ? latest.response_time_ms : null;
       this.lastCheckedAt = latest ? latest.checked_at : null;
       this.detail = latest ? latest.detail : null;
+      // Anchor windows to the newest server-recorded probe time (falls back to
+      // the browser clock only while there is no data).
+      if (latest) this._bumpServerNow(latest.checked_at);
       const proto = latest ? latest.protocol : null;
       this.timelineKind = (proto === 'publicip' || proto === 'border') ? proto : '';
 
       this.loading = false;
       this.$nextTick(() => this.selectWindow(this.activeWindow));
+
+      // Stay current as probes arrive (matches the dashboard): subscribe to the
+      // live stream, fall back to polling, and tear down on navigation.
+      this.connectLive();
+      window.addEventListener('beforeunload', () => this._teardownLive());
+    },
+
+    // ── Live updates ──────────────────────────────────────────────────────────
+    // Subscribe to the shared SSE feed and refresh in place for THIS monitor.
+    // Header fields update instantly from the event; the visible range is
+    // reloaded on a debounce so a just-started monitor's data fills in without a
+    // manual reload. A poll covers any window where the stream is unavailable.
+    connectLive() {
+      if (!('EventSource' in window)) { this._startPoll(); return; }
+      try {
+        eventSource = new EventSource('/api/monitors/stream');
+      } catch (e) {
+        console.warn('SSE unavailable, relying on poll', e);
+        this._startPoll();
+        return;
+      }
+      eventSource.onopen = () => this._stopPoll(); // stream live → poll not needed
+      eventSource.onmessage = (ev) => {
+        let u;
+        try { u = JSON.parse(ev.data); } catch (e) { return; }
+        if (u.name !== this.monitorName) return; // ignore other monitors
+        this._onLiveUpdate(u);
+      };
+      // Browser auto-reconnects on error; the poll covers the gap meanwhile.
+      eventSource.onerror = () => this._startPoll();
+    },
+
+    // Update the header/strip fields directly from a status payload.
+    _applyLiveStatus(u) {
+      this.currentStatus = u.status;
+      this.lastResponseMs = u.response_time_ms;
+      this.lastCheckedAt = u.last_checked_at;
+      this.detail = u.detail;
+      this._bumpServerNow(u.last_checked_at); // advance the anchor with fresh data
+    },
+
+    // The server-data anchor: newest known probe time, or the browser clock when
+    // no probe data has been seen yet.
+    _anchorMs() {
+      return serverNowMs ?? Date.now();
+    },
+    // Advance the anchor to the newest server timestamp seen (never rewind).
+    _bumpServerNow(iso) {
+      if (!iso) return;
+      const ms = Date.parse(iso);
+      if (!Number.isNaN(ms)) serverNowMs = Math.max(serverNowMs ?? 0, ms);
+    },
+
+    // Apply a live status payload and refresh the view — but for state-timeline
+    // monitors only reload the chart when the tracked value actually changes
+    // (suppresses per-probe flashing). Response-time monitors always refresh.
+    _onLiveUpdate(u) {
+      this._applyLiveStatus(u);
+      if (this.timelineKind) {
+        const incoming = extractState({ detail: u.detail ?? '' });
+        if (incoming !== lastTimelineValue) this._scheduleLiveRefresh();
+      } else {
+        this._scheduleLiveRefresh();
+      }
+    },
+
+    // Reload the visible data, debounced, without stealing the user's view.
+    _scheduleLiveRefresh() {
+      if (liveRefreshTimer) clearTimeout(liveRefreshTimer);
+      liveRefreshTimer = setTimeout(() => {
+        if (isApplying) { this._scheduleLiveRefresh(); return; } // retry after apply
+        if (debounceTimer) return; // a user zoom/pan refetch is queued; it'll refresh
+        this._refreshVisible();
+      }, LIVE_REFRESH_DEBOUNCE_MS);
+    },
+
+    // Refresh whatever is on screen. At the full active window (not zoomed) slide
+    // it to include "now" so fresh probes appear; if the user has zoomed/panned,
+    // keep their exact range (and position).
+    _refreshVisible() {
+      if (windowFrom == null) return;                 // window not initialized yet
+      if (!chart) { this.selectWindow(this.activeWindow); return; }
+      const dz = (chart.getOption().dataZoom || [])[0] || {};
+      const start = dz.start ?? 0, end = dz.end ?? 100;
+      const atFull = start <= 0.05 && end >= 99.95;
+      if (atFull) {
+        this.selectWindow(this.activeWindow);         // slides to now; view stays full
+      } else {
+        const span = windowTo - windowFrom;
+        const fromMs = windowFrom + span * (start / 100);
+        const toMs = windowFrom + span * (end / 100);
+        this.loadRange(fromMs, toMs, false);          // preserve zoom/pan position
+      }
+    },
+
+    _startPoll() {
+      if (pollTimer) return;                          // already polling
+      pollTimer = setInterval(() => this._pollOnce(), POLL_MS);
+    },
+    _stopPoll() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    },
+    async _pollOnce() {
+      try {
+        const name = encodeURIComponent(this.monitorName);
+        const rows = await (await fetch(`/api/monitors/${name}/history?limit=1`)).json();
+        const latest = Array.isArray(rows) ? rows[0] : null;
+        if (latest) this._onLiveUpdate({
+          name: this.monitorName,
+          status: latest.status,
+          response_time_ms: latest.response_time_ms,
+          last_checked_at: latest.checked_at,
+          detail: latest.detail,
+        });
+      } catch (e) { /* poll is best-effort */ }
+    },
+    _teardownLive() {
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      this._stopPoll();
+      if (liveRefreshTimer) { clearTimeout(liveRefreshTimer); liveRefreshTimer = null; }
     },
 
     // Select a window: it fixes the chart's time axis and loads the window's data.
     async selectWindow(label) {
       this.activeWindow = label;
       const secs = WINDOW_SECS[label] ?? 86400;
-      windowTo = Date.now();
+      windowTo = this._anchorMs(); // server data time, not the browser clock
       windowFrom = windowTo - secs * 1000;
       await this.loadRange(windowFrom, windowTo, /* reset view to full window */ true);
     },
@@ -88,7 +224,7 @@ function monitorDetail() {
     // Fetch data at a resolution matched to the range, then render.
     async loadRange(fromMs, toMs, resetView = false) {
       const name = encodeURIComponent(this.monitorName);
-      const to = Math.min(toMs, Date.now());
+      const to = Math.min(toMs, this._anchorMs()); // clamp to server data time, not browser clock
       const from = Math.min(fromMs, to - 1000);
       const fromIso = new Date(from).toISOString();
       const toIso = new Date(to).toISOString();
@@ -104,9 +240,13 @@ function monitorDetail() {
             + `&to=${encodeURIComponent(toIso)}&limit=${RAW_LIMIT}`;
           const rows = await (await fetch(histUrl)).json().catch(() => []);
           if (seq !== refetchSeq) return;
+          if (rows[0]) this._bumpServerNow(rows[0].checked_at); // rows are newest-first
           const asc = [...rows].reverse();
           this.sampleCount = rows.length;
           tlSegments = buildSegments(asc, to, this.timelineKind, tlColorMap);
+          // Remember the value currently on screen so live events can detect a
+          // real change and only then reload the timeline (no per-probe flashing).
+          lastTimelineValue = tlSegments.length ? tlSegments[tlSegments.length - 1].state : null;
           this.tlLegend = buildLegend(tlSegments);
           this.lossCount = 0;
           this.hasData = tlSegments.length > 0;
@@ -120,6 +260,8 @@ function monitorDetail() {
           + `&to=${encodeURIComponent(toIso)}&buckets=${BUCKET_TARGET}`;
         const series = await (await fetch(serUrl)).json().catch(() => []);
         if (seq !== refetchSeq) return;
+        const lastBucket = series[series.length - 1]; // series is ascending by ts
+        if (lastBucket) this._bumpServerNow(lastBucket.ts);
         const total = series.reduce((acc, b) => acc + (b.count || 0), 0);
 
         let downFlags;
@@ -128,6 +270,7 @@ function monitorDetail() {
             + `&to=${encodeURIComponent(toIso)}&limit=${RAW_LIMIT}`;
           const rows = await (await fetch(histUrl)).json().catch(() => []);
           if (seq !== refetchSeq) return;
+          if (rows[0]) this._bumpServerNow(rows[0].checked_at); // rows are newest-first
           const asc = [...rows].reverse();
           lineData = asc.map(r => [Date.parse(r.checked_at), r.response_time_ms]);
           downFlags = asc.map(r => r.status === 'down');
@@ -203,7 +346,7 @@ function monitorDetail() {
     _computeIpSummary(segs) {
       const last = segs[segs.length - 1];
       this.ipCurrent = last ? last.state : null; // null → currently unreachable
-      this.ipStableFor = last ? fmtDuration(Math.max(0, (last.end ?? Date.now()) - last.start)) : '—';
+      this.ipStableFor = last ? fmtDuration(Math.max(0, (last.end ?? this._anchorMs()) - last.start)) : '—';
       let changes = 0, prev = null;
       const seen = new Set();
       for (const s of segs) {
@@ -473,7 +616,8 @@ function buildSegments(asc, toMs, kind, colorMap) {
     if (last) last.end = t;
     segs.push({ state, start: t, end: null });
   }
-  if (segs.length) segs[segs.length - 1].end = Math.min(Date.now(), toMs);
+  // toMs is the server-anchored window end; don't clip with the browser clock.
+  if (segs.length) segs[segs.length - 1].end = toMs;
   for (const s of segs) {
     s.color = colorForState(kind, s.state, colorMap);
     s.label = stateLabel(kind, s.state);
