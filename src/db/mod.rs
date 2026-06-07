@@ -521,7 +521,7 @@ pub async fn get_state_segments(
         let t: i64 = row.try_get("checked_at")?;
         // Leading token of detail: the IP address for publicip, fault class for border.
         let state = detail.as_deref()
-            .and_then(|d| d.trim().split_whitespace().next())
+            .and_then(|d| d.split_whitespace().next())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         match segs.last_mut() {

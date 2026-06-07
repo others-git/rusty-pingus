@@ -78,7 +78,7 @@ pub async fn run(cfg: &TracerouteMonitorConfig) -> (ProbeResult, Option<TraceRun
     let run = TraceRunInput { reached: outcome.reached, hops: outcome.hops };
 
     let summary = if outcome.reached {
-        let dest_ms = outcome.dest_rtt_us.map(|us| (us / 1000).max(0)).unwrap_or(0);
+        let dest_ms = outcome.dest_rtt_us.map(|us| us / 1000).unwrap_or(0);
         let detail = match outcome.dest_addr {
             Some(d) => format!("{hop_count} hops · reached {d}"),
             None => format!("{hop_count} hops · reached"),

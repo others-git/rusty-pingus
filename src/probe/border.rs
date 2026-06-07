@@ -134,10 +134,9 @@ fn detect_gateway_windows() -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() >= 3 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0" {
-            if cols[2].parse::<std::net::IpAddr>().is_ok() {
-                return Some(cols[2].to_string());
-            }
+        if cols.len() >= 3 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0"
+            && cols[2].parse::<std::net::IpAddr>().is_ok() {
+            return Some(cols[2].to_string());
         }
     }
     None
