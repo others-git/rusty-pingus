@@ -153,42 +153,43 @@ async fn run_probe(
     Ok(())
 }
 
-pub async fn retention_loop(pool: SqlitePool, retention_days: u64, cancel: CancellationToken) {
-    info!(retention_days, "Retention loop started; pruning probe results older than this daily");
-    let mut ticker = tokio::time::interval(Duration::from_secs(86_400));
+/// Per-monitor retention loop: runs hourly, reads the live monitor list, and
+/// prunes each monitor's probe_results + rollups (and traceroute hops) to its
+/// own `retention_hours` setting. Picks up config changes without a restart.
+pub async fn per_monitor_retention_loop(
+    pool: SqlitePool,
+    monitors: MonitorStore,
+    global_retention_days: u64,
+    cancel: CancellationToken,
+) {
+    info!(global_retention_days, "Per-monitor retention loop started");
+    let mut ticker = tokio::time::interval(Duration::from_secs(3_600));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                match db::prune_old_results(&pool, retention_days).await {
-                    Ok(n) => info!(deleted = n, "Pruned old probe results"),
-                    Err(e) => error!(error = %e, "Retention cleanup failed"),
-                }
-                if let Err(e) = db::prune_old_rollups(&pool, retention_days).await {
-                    error!(error = %e, "Rollup retention cleanup failed");
-                }
-            }
-            _ = cancel.cancelled() => break,
-        }
-    }
-}
+                for monitor in monitors.list().await {
+                    let name = monitor.name().to_string();
+                    let retention_hours = monitor.retention_hours(global_retention_days);
+                    let cutoff_ms = (chrono::Utc::now()
+                        - chrono::Duration::hours(retention_hours as i64))
+                        .timestamp_millis();
+                    let cutoff_epoch = cutoff_ms / 1000;
 
-/// Prune traceroute data per its own monitor-configured retention. Runs on a
-/// fixed cadence, reading the current monitor list so added/removed monitors are
-/// picked up without restart.
-pub async fn traceroute_retention_loop(pool: SqlitePool, monitors: MonitorStore, cancel: CancellationToken) {
-    info!("Traceroute retention loop started");
-    let mut ticker = tokio::time::interval(Duration::from_secs(60));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {
-                for m in monitors.list().await {
-                    if let MonitorConfig::Traceroute(cfg) = m {
-                        match db::prune_traceroute(&pool, &cfg.name, cfg.retention_ms).await {
-                            Ok(n) if n > 0 => info!(monitor = %cfg.name, deleted = n, "Pruned old traceroute runs"),
+                    match db::prune_monitor_results(&pool, &name, cutoff_ms).await {
+                        Ok(n) if n > 0 => info!(monitor = %name, deleted = n, retention_hours, "Pruned old probe results"),
+                        Ok(_) => {}
+                        Err(e) => error!(monitor = %name, error = %e, "Probe result prune failed"),
+                    }
+                    if let Err(e) = db::prune_monitor_rollups(&pool, &name, cutoff_epoch).await {
+                        error!(monitor = %name, error = %e, "Rollup prune failed");
+                    }
+                    if matches!(monitor, MonitorConfig::Traceroute(_)) {
+                        let retention_ms = retention_hours.saturating_mul(3_600_000);
+                        match db::prune_traceroute(&pool, &name, retention_ms).await {
+                            Ok(n) if n > 0 => info!(monitor = %name, deleted = n, "Pruned old traceroute runs"),
                             Ok(_) => {}
-                            Err(e) => error!(monitor = %cfg.name, error = %e, "Traceroute prune failed"),
+                            Err(e) => error!(monitor = %name, error = %e, "Traceroute prune failed"),
                         }
                     }
                 }

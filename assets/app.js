@@ -23,7 +23,7 @@ function dashboard() {
       upstream: '1.1.1.1',
       max_hops: 30,
       queries_per_hop: 3,
-      retention_hours: 24,
+      retention_hours: null,
       interval_ms: 60000,
       timeout_ms: 10000,
     },
@@ -116,6 +116,9 @@ function dashboard() {
         timeout_ms: this.form.timeout_ms,
       };
 
+      // Per-monitor retention (hours) applies to all protocols; omit when blank.
+      if (this.form.retention_hours > 0) body.retention_hours = this.form.retention_hours;
+
       if (this.form.protocol === 'http') {
         body.url = this.form.url;
         body.method = this.form.method;
@@ -130,8 +133,6 @@ function dashboard() {
         body.host = this.form.host;
         body.max_hops = this.form.max_hops;
         body.queries_per_hop = this.form.queries_per_hop;
-        // UI collects retention in hours; the API stores milliseconds.
-        body.retention_ms = Math.max(1, Math.round((this.form.retention_hours || 24) * 3600 * 1000));
       } else {
         body.host = this.form.host;
         if (this.form.protocol === 'tcp') body.port = this.form.port;
@@ -187,6 +188,9 @@ function dashboard() {
         expected_status: null,
         gateway: '',
         upstream: '1.1.1.1',
+        max_hops: 30,
+        queries_per_hop: 3,
+        retention_hours: null,
         interval_ms: 60000,
         timeout_ms: 10000,
       };
@@ -195,6 +199,10 @@ function dashboard() {
 
     formatRelative(iso) {
       return window.RP.formatRelative(iso);
+    },
+
+    isTraceUnavailable(m) {
+      return window.RP.isTraceUnavailable(m.protocol, m.status, m.failure_reason);
     },
 
     protocolIcon(protocol) {

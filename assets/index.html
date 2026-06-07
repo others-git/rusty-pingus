@@ -78,8 +78,8 @@
                'border-l-4 border-l-slate-600': !m.enabled,
                'opacity-60': !m.enabled,
                'border-l-4 border-l-emerald-500': m.enabled && m.status === 'up',
-               'border-l-4 border-l-red-500': m.enabled && m.status === 'down',
-               'border-l-4 border-l-amber-500': m.enabled && (!m.status || m.status === 'pending')
+               'border-l-4 border-l-red-500': m.enabled && m.status === 'down' && !isTraceUnavailable(m),
+               'border-l-4 border-l-amber-500': m.enabled && ((!m.status || m.status === 'pending') || isTraceUnavailable(m))
              }">
 
           <!-- Whole-tile link (stretched overlay). Interactive controls below sit
@@ -100,10 +100,10 @@
                   <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                   <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400"></span>
                 </span>
-                <span x-show="m.enabled && m.status === 'down'" class="relative flex h-2.5 w-2.5">
+                <span x-show="m.enabled && m.status === 'down' && !isTraceUnavailable(m)" class="relative flex h-2.5 w-2.5">
                   <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-400"></span>
                 </span>
-                <span x-show="m.enabled && (!m.status || m.status === 'pending')" class="relative flex h-2.5 w-2.5">
+                <span x-show="m.enabled && ((!m.status || m.status === 'pending') || isTraceUnavailable(m))" class="relative flex h-2.5 w-2.5">
                   <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-400"></span>
                 </span>
                 <span x-show="!m.enabled" class="relative flex h-2.5 w-2.5">
@@ -113,10 +113,11 @@
                       :class="{
                         'bg-slate-500/10 text-slate-400': !m.enabled,
                         'bg-emerald-400/10 text-emerald-400': m.enabled && m.status === 'up',
-                        'bg-red-400/10 text-red-400': m.enabled && m.status === 'down',
-                        'bg-amber-400/10 text-amber-400': m.enabled && (!m.status || m.status === 'pending')
+                        'bg-red-400/10 text-red-400': m.enabled && m.status === 'down' && !isTraceUnavailable(m),
+                        'bg-amber-400/10 text-amber-400': m.enabled && ((!m.status || m.status === 'pending') || isTraceUnavailable(m))
                       }"
-                      x-text="!m.enabled ? 'paused' : (m.status || 'pending')">
+                      :title="isTraceUnavailable(m) ? 'Traceroute needs elevated privileges (CAP_NET_RAW)' : ''"
+                      x-text="!m.enabled ? 'paused' : (isTraceUnavailable(m) ? 'unavailable' : (m.status || 'pending'))">
                 </span>
               </div>
             </div>
@@ -314,7 +315,7 @@
                      :class="formErrors.host ? 'border-red-500' : 'border-slate-700'" />
               <p x-show="formErrors.host" x-text="formErrors.host" class="text-red-400 text-xs mt-1"></p>
             </div>
-            <div class="grid grid-cols-3 gap-3">
+            <div class="grid grid-cols-2 gap-3">
               <div>
                 <label class="block text-xs font-medium text-slate-400 mb-1">Max hops</label>
                 <input x-model.number="form.max_hops" type="number" min="1" max="64" step="1"
@@ -325,13 +326,16 @@
                 <input x-model.number="form.queries_per_hop" type="number" min="1" max="10" step="1"
                        class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500" />
               </div>
-              <div>
-                <label class="block text-xs font-medium text-slate-400 mb-1">Retention (h)</label>
-                <input x-model.number="form.retention_hours" type="number" min="1" step="1"
-                       class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500" />
-              </div>
             </div>
             <p class="text-slate-600 text-xs">A run probes each hop and stores per-hop latency. Minimum interval is 500 ms.</p>
+          </div>
+
+          <!-- Retention (all protocols, optional) -->
+          <div>
+            <label class="block text-xs font-medium text-slate-400 mb-1">Retention (hours) <span class="text-slate-600">(optional)</span></label>
+            <input x-model.number="form.retention_hours" type="number" min="1" step="1" placeholder="global default"
+                   class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-cyan-500" />
+            <p class="text-slate-600 text-xs mt-1">Leave blank to use the global default (90 days).</p>
           </div>
 
           <!-- Interval + Timeout (all protocols) -->

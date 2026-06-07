@@ -33,6 +33,8 @@ async fn tcp_probe_up_stored_in_db() {
         port: addr.port(),
         interval_ms: 60_000,
         timeout_ms: 5_000,
+        retention_hours: None,
+        enabled: true,
     };
 
     let result = probe::tcp::run(&cfg).await;
@@ -67,6 +69,8 @@ async fn tcp_probe_down_stored_in_db() {
         port: refused_port,
         interval_ms: 60_000,
         timeout_ms: 2_000,
+        retention_hours: None,
+        enabled: true,
     };
 
     let result = probe::tcp::run(&cfg).await;

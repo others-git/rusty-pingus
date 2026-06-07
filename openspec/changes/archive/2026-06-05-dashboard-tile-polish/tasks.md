@@ -10,4 +10,4 @@
 - [~] 2.1 Clicking anywhere on a tile (not a button) navigates to the monitor detail page; the cursor/affordance covers the whole tile.
 - [~] 2.2 Pause/resume and delete still work and do NOT navigate; the controls appear bottom-right on hover and never cover the status badge.
 - [~] 2.3 Paused and down tiles still render their distinct states correctly; short tiles no longer show obvious dead space below "Checked …".
-- [ ] 2.4 Sync the `web-ui` main spec via this change's delta at archive time.
+- [x] 2.4 Sync the `web-ui` main spec via this change's delta at archive time.

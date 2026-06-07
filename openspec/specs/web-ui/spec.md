@@ -333,15 +333,15 @@ The monitor detail page SHALL render a purpose-built layout for `traceroute` mon
 - **THEN** its row indicates the unreachable state rather than showing a misleading latency
 
 ### Requirement: Per-hop latency graph
-The traceroute detail page SHALL visualize per-hop latency as a single connected graph aligned to the hop rows: for each hop a band spanning its minimum-to-maximum RTT and a marker at its average, with the per-hop averages joined by a line down the hops, so relative latency across the path is readable at a glance. A non-responding hop SHALL be shown without a band or marker rather than as zero latency.
+The traceroute detail page SHALL visualize per-hop latency as a single continuous min–max ribbon aligned to the hop rows: one filled band whose edges follow each hop's minimum and maximum RTT, connected vertically across hops so it forms one continuous shape, with the per-hop averages overlaid as a line of markers. Relative latency and where the min–max spread widens across the path SHALL be readable at a glance. A non-responding hop SHALL break the ribbon (and the average line) rather than being drawn as zero latency.
 
-#### Scenario: Latency shown as a connected per-hop graph
+#### Scenario: Latency shown as a continuous min–max ribbon
 - **WHEN** the hop table renders
-- **THEN** each hop shows a min–max band and an average marker, and the per-hop averages are connected into one graph down the rows
+- **THEN** the min–max range is drawn as one continuous filled ribbon across the hops, with the per-hop averages overlaid as a connected line of markers
 
-#### Scenario: Non-responding hop leaves a gap
+#### Scenario: Non-responding hop breaks the ribbon
 - **WHEN** a hop did not respond over the active range
-- **THEN** it shows no band or average marker rather than a latency of zero
+- **THEN** the ribbon (and the average line) break at that hop rather than pinching to zero latency
 
 ### Requirement: Resizable time-range brush for traceroute data
 The traceroute detail page SHALL provide a resizable scroll/brush control that selects the time range used to compute the per-hop table, operating within the monitor's retained data. Adjusting the control SHALL re-aggregate the table over the selected range. The page SHALL NOT use the fixed 1h/24h/7d/30d uptime windows for this monitor type.
@@ -375,3 +375,66 @@ Each monitor on the dashboard SHALL provide a control to enable or disable it, c
 #### Scenario: Paused state shown without waiting for a probe
 - **WHEN** a disabled monitor's card renders (no live probe events arrive while paused)
 - **THEN** the paused state is shown based on the monitor's enabled flag from the list/poll
+
+### Requirement: Monitor tile is a clickable link with non-overlapping controls
+Each dashboard monitor tile SHALL be a single clickable link to that monitor's detail page — clicking anywhere on the tile that is not an interactive control SHALL navigate to the detail page. The per-tile controls (pause/resume and delete) SHALL be positioned so they do not overlap the status badge; they SHALL remain independently clickable (activating a control SHALL NOT navigate to the detail page) and MAY be revealed on hover.
+
+#### Scenario: Clicking the tile opens the detail page
+- **WHEN** a user clicks anywhere on a monitor tile other than a control button
+- **THEN** the browser navigates to that monitor's detail page
+
+#### Scenario: Controls do not overlap the status badge
+- **WHEN** a monitor tile renders (and its controls are revealed)
+- **THEN** the pause/resume and delete controls are positioned away from the status badge and do not cover it
+
+#### Scenario: Activating a control does not navigate
+- **WHEN** a user clicks the pause/resume or delete control on a tile
+- **THEN** that action runs (toggle or delete-confirm) and the tile does not navigate to the detail page
+
+### Requirement: Traceroute privilege/unavailability is surfaced distinctly
+When a `traceroute` monitor's latest probe failed because its raw socket could not be opened (a privilege/socket failure such as missing CAP_NET_RAW), the dashboard and the traceroute detail view SHALL present a distinct "unavailable — requires elevated privileges" state with a short explanation, visually separate from a normal network "down". A traceroute that fails for ordinary network reasons (timeout/unreachable) SHALL keep its normal down presentation.
+
+#### Scenario: Privilege failure shown as unavailable, not plain down
+- **WHEN** a traceroute monitor's latest probe failed due to a privilege/socket error
+- **THEN** its dashboard card and detail page show a distinct "unavailable — needs elevated privileges (CAP_NET_RAW)" state with a brief explanation, not a bare "down"
+
+#### Scenario: Ordinary failure unaffected
+- **WHEN** a traceroute monitor fails for a normal network reason (e.g. timeout)
+- **THEN** it is shown with the usual down presentation, not the privilege/unavailable state
+
+#### Scenario: State clears when the monitor can run
+- **WHEN** a previously privilege-failed traceroute monitor later probes successfully
+- **THEN** the unavailable state is no longer shown
+
+### Requirement: Detail page uses a retention-bounded time brush
+The monitor detail page SHALL provide a resizable time-range brush spanning the monitor's retained data (`[now − retention, now]`) as the control for the chart's active range, replacing the fixed 1h/24h/7d/30d range buttons. Adjusting the brush SHALL reload the chart/timeline for the selected range. Uptime percentages MAY still be shown as read-only statistics. This applies to response-time and state-timeline monitor detail pages.
+
+#### Scenario: Brush sets the chart range
+- **WHEN** a user resizes or moves the detail-page time brush
+- **THEN** the chart/timeline reloads for the newly selected range
+
+#### Scenario: Brush is bounded by retention
+- **WHEN** the detail page renders for a monitor with a given retention
+- **THEN** the brush spans at most the retained window and cannot select a range with no retained data
+
+#### Scenario: Uptime figures remain as stats
+- **WHEN** a user views the detail page
+- **THEN** the 1h/24h/7d/30d uptime percentages are still shown as read-only statistics (no longer the chart-range control)
+
+### Requirement: State-timeline detail renders the full selected window
+The public-IP/border detail timeline SHALL render the entire selected range, not only the most recent capped slice of raw probes. For a high-frequency monitor, the timeline SHALL still show the whole window's state history.
+
+#### Scenario: Full window shown for a fast monitor
+- **WHEN** a public-IP monitor probing frequently is viewed over a multi-hour window
+- **THEN** the timeline shows the whole window's IP history, not just the most recent ~15 minutes
+
+### Requirement: Retention is shown and configurable in the UI
+The add-monitor form SHALL collect a monitor's retention in hours, and the monitor detail page SHALL surface the configured retention.
+
+#### Scenario: Set retention when creating a monitor
+- **WHEN** a user creates a monitor and enters a retention in hours
+- **THEN** the monitor is created with that retention
+
+#### Scenario: Retention shown on the detail page
+- **WHEN** a user views a monitor's detail page
+- **THEN** the monitor's configured retention is displayed

@@ -93,7 +93,7 @@
         <div class="text-xl font-bold text-slate-100" x-text="ipStableFor"></div>
       </div>
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
-        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1" x-text="'IP changes (' + activeWindow + ')'"></div>
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1">IP changes</div>
         <div class="text-xl font-bold"
              :class="ipChanges > 0 ? 'text-amber-400' : 'text-slate-100'"
              x-text="ipChanges.toLocaleString()"></div>
@@ -110,20 +110,32 @@
         <!-- Time-range brush over the retained data -->
         <section class="bg-slate-800 border border-slate-700 rounded-xl p-5">
           <div class="flex items-center justify-between mb-3">
-            <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
-              <span>Time range</span>
-              <span x-show="traceLoading" class="text-slate-500 normal-case tracking-normal">
-                <i class="fa-solid fa-circle-notch fa-spin"></i> updating…
-              </span>
-            </h2>
-            <span class="text-xs text-slate-500" x-text="traceRangeLabel()"></span>
+            <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400">Time Range</h2>
+            <div class="flex items-center gap-2 text-xs text-slate-500">
+              <i class="fa-solid fa-circle-notch text-slate-600 transition-opacity duration-150"
+                 :class="traceLoading ? 'fa-spin opacity-100' : 'opacity-0'"></i>
+              <span x-text="traceRangeLabel()"></span>
+            </div>
           </div>
-          <div id="trace-brush" class="w-full" style="height: 72px;"></div>
+          <div id="trace-brush" class="w-full" style="height: 40px;"></div>
           <p class="text-slate-600 text-xs mt-1">Drag the handles to refine the range; min/avg/max below recompute over it.</p>
         </section>
 
+        <!-- Privilege/unavailability notice — shown instead of the hop table -->
+        <section x-show="isTraceUnavailable"
+                 class="bg-amber-950/40 border border-amber-700/50 rounded-xl p-5 flex items-start gap-4">
+          <i class="fa-solid fa-lock text-amber-400 mt-0.5 text-lg shrink-0"></i>
+          <div>
+            <p class="text-amber-300 font-semibold text-sm mb-1">Traceroute unavailable — elevated privileges required</p>
+            <p class="text-amber-200/60 text-xs leading-relaxed">
+              This monitor needs <code class="bg-amber-900/50 px-1 rounded">CAP_NET_RAW</code> to open a raw ICMP socket.
+              Run the binary with elevated privileges, or in Docker add <code class="bg-amber-900/50 px-1 rounded">--cap-add=NET_RAW</code>.
+            </p>
+          </div>
+        </section>
+
         <!-- Per-hop table with relative-latency bars -->
-        <section class="bg-slate-900 border border-slate-700 rounded-xl p-6">
+        <section x-show="!isTraceUnavailable" class="bg-slate-900 border border-slate-700 rounded-xl p-6">
           <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-4 flex items-center gap-2">
             <span>Path</span>
             <span class="text-slate-600" x-text="detail || ''"></span>
@@ -148,10 +160,15 @@
                 <template x-for="(h, i) in traceHops" :key="h.hop_no">
                   <tr class="border-b border-slate-800/60 h-9">
                     <td class="pr-3 text-slate-400 font-mono" x-text="h.hop_no"></td>
-                    <td class="pr-3 font-mono truncate"
-                        :class="h.reachable ? 'text-cyan-300' : 'text-slate-600'"
-                        :title="h.reachable ? (h.addr || '') : 'no reply'"
-                        x-text="h.reachable ? (h.addr || '—') : '* (no reply)'"></td>
+                    <td class="pr-3 font-mono whitespace-nowrap">
+                      <span :class="h.reachable ? 'text-cyan-300' : 'text-slate-600'"
+                            :title="h.reachable ? (h.addr || '') : 'no reply'"
+                            x-text="h.reachable ? (h.addr || '—') : '* (no reply)'"></span>
+                      <a x-show="h.reachable && h.addr"
+                         :href="'https://who.is/whois-ip/ip-address/' + h.addr"
+                         target="_blank" rel="noopener noreferrer"
+                         class="ml-2 text-[10px] font-sans font-medium px-1 py-0.5 rounded border border-slate-600 text-slate-400 hover:border-cyan-500 hover:text-cyan-400 transition-colors leading-none">WHOIS</a>
+                    </td>
                     <td class="pr-3 text-right text-slate-100" x-text="traceFmtMs(h.avg_ms)"></td>
                     <td class="pr-3 text-right text-slate-400" x-text="traceFmtMs(h.min_ms)"></td>
                     <td class="pr-3 text-right text-slate-400" x-text="traceFmtMs(h.max_ms)"></td>
@@ -192,19 +209,34 @@
         <div class="text-xl font-bold text-slate-100" x-text="lastCheckedAt ? formatRelative(lastCheckedAt) : '—'"></div>
       </div>
       <div class="bg-slate-800 border border-slate-700 rounded-xl px-4 py-3">
-        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1" x-text="'Samples (' + activeWindow + ')'"></div>
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-1" x-text="timelineKind ? 'Segments' : 'Samples'"></div>
         <div class="text-xl font-bold text-slate-100" x-text="sampleCount.toLocaleString()"></div>
       </div>
     </section>
 
-    <!-- ── Uptime windows (clickable selectors that set the chart range) ──── -->
+    <!-- ── Time-range brush (non-traceroute) ─────────────────────────────── -->
     <section x-show="!isTraceroute" class="bg-slate-800 border border-slate-700 rounded-xl p-5">
-      <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-4">Uptime — click to set chart range</h2>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
+          <span>Time Range</span>
+          <span x-show="retentionLabel()" class="text-slate-600 normal-case tracking-normal font-normal" x-text="'· retains ' + retentionLabel()"></span>
+        </h2>
+        <div class="flex items-center gap-2 text-xs text-slate-500">
+          <i class="fa-solid fa-circle-notch text-slate-600 transition-opacity duration-150"
+             :class="isLoadingDetail ? 'fa-spin opacity-100' : 'opacity-0'"></i>
+          <span x-text="detailRangeLabel()"></span>
+        </div>
+      </div>
+      <div id="detail-brush" class="w-full" style="height: 40px;"></div>
+      <p class="text-slate-600 text-xs mt-1">Drag the handles to set the chart range; reset loads the full retention window.</p>
+    </section>
+
+    <!-- ── Uptime windows (fixed-window stats) ────────────────────────────── -->
+    <section x-show="!isTraceroute && timelineKind !== 'publicip'" class="bg-slate-800 border border-slate-700 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-4">Uptime</h2>
       <div class="flex flex-wrap gap-6 justify-around">
         <template x-for="w in uptimeWindows" :key="w.label">
-          <button type="button" @click="selectWindow(w.label)"
-                  class="flex flex-col items-center gap-2 rounded-xl p-2 transition-all focus:outline-none"
-                  :class="activeWindow === w.label ? 'ring-2 ring-cyan-500 bg-slate-900' : 'hover:bg-slate-900/60'">
+          <div class="flex flex-col items-center gap-2 rounded-xl p-2">
             <div class="relative w-20 h-20">
               <svg class="w-20 h-20 -rotate-90" viewBox="0 0 100 100">
                 <circle cx="50" cy="50" r="40" fill="none" stroke="#1e293b" stroke-width="8" />
@@ -224,10 +256,8 @@
                       x-text="w.value != null ? w.value.toFixed(1) + '%' : '—'"></span>
               </div>
             </div>
-            <span class="text-xs font-medium"
-                  :class="activeWindow === w.label ? 'text-cyan-400' : 'text-slate-400'"
-                  x-text="w.label"></span>
-          </button>
+            <span class="text-xs font-medium text-slate-400" x-text="w.label"></span>
+          </div>
         </template>
       </div>
     </section>
@@ -237,11 +267,9 @@
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
           <span x-text="timelineKind === 'publicip' ? 'Public IP' : (timelineKind === 'border' ? 'Border Status' : 'Response Time')"></span>
-          <span class="text-slate-600" x-text="'· ' + activeWindow"></span>
           <span x-show="!timelineKind && chartMode === 'raw'" class="text-cyan-500/70 normal-case tracking-normal">(raw)</span>
-          <span x-show="isLoadingDetail" class="text-slate-500 normal-case tracking-normal">
-            <i class="fa-solid fa-circle-notch fa-spin"></i> updating…
-          </span>
+          <i class="fa-solid fa-circle-notch text-slate-600 transition-opacity duration-150"
+             :class="isLoadingDetail ? 'fa-spin opacity-100' : 'opacity-0'"></i>
         </h2>
         <div class="flex items-center gap-3 text-xs text-slate-500">
           <span class="hidden sm:inline"><i class="fa-solid fa-arrows-left-right-to-line mr-1"></i>scroll to zoom · drag to pan · slider below</span>

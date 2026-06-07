@@ -14,6 +14,8 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # Timing fields are in milliseconds: interval_ms and timeout_ms.
 # Any monitor may set `enabled = false` to pause it (kept in config + history,
 # but not probed). Omit the key for the default (enabled).
+# Any monitor may set `retention_hours` to control how long its data is kept
+# (default: the global retention_days × 24, e.g. 2160 h for the 90-day default).
 
 # HTTP monitor example:
 # [[monitors]]
@@ -23,6 +25,7 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # interval_ms = 60000
 # timeout_ms = 10000
 # expected_status = 200  # optional; any 2xx accepted if omitted
+# retention_hours = 2160 # optional; default is the global 90-day setting
 
 # TCP monitor example:
 # [[monitors]]
@@ -64,7 +67,7 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # timeout_ms = 1000         # per-hop reply wait
 # max_hops = 30             # optional (default 30)
 # queries_per_hop = 3       # optional (default 3)
-# retention_ms = 86400000   # optional (default 24h); bounds stored per-hop data
+# retention_hours = 24      # optional (default 24 h); bounds stored per-hop data
 "#;
 
 // ── Monitor config types ──────────────────────────────────────────────────────
@@ -153,6 +156,20 @@ impl MonitorConfig {
         }
     }
 
+    /// How many hours to retain this monitor's stored data, falling back to
+    /// `global_retention_days × 24` when the monitor has no explicit setting.
+    pub fn retention_hours(&self, global_retention_days: u64) -> u64 {
+        let raw = match self {
+            Self::Http(c) => c.retention_hours,
+            Self::Tcp(c) => c.retention_hours,
+            Self::Icmp(c) => c.retention_hours,
+            Self::PublicIp(c) => c.retention_hours,
+            Self::Border(c) => c.retention_hours,
+            Self::Traceroute(c) => c.retention_hours,
+        };
+        raw.filter(|&h| h > 0).unwrap_or(global_retention_days.saturating_mul(24))
+    }
+
     /// Set the enabled flag on this monitor (any variant).
     fn set_enabled(&mut self, enabled: bool) {
         match self {
@@ -180,6 +197,8 @@ pub struct HttpMonitorConfig {
     pub headers: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_hours: Option<u64>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
 }
@@ -192,6 +211,8 @@ pub struct TcpMonitorConfig {
     pub port: u16,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_hours: Option<u64>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
 }
@@ -206,6 +227,8 @@ pub struct IcmpMonitorConfig {
     /// Number of ICMP echo requests sent per probe cycle. The monitor is up if
     /// at least one reply is received; defaults to 3, clamped to a minimum of 1.
     pub count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_hours: Option<u64>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
 }
@@ -220,6 +243,8 @@ pub struct PublicIpMonitorConfig {
     pub url: Option<String>,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_hours: Option<u64>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
 }
@@ -235,6 +260,8 @@ pub struct BorderMonitorConfig {
     pub upstream: String,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_hours: Option<u64>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
 }
@@ -252,9 +279,11 @@ pub struct TracerouteMonitorConfig {
     /// ICMP echoes sent per hop per run; the per-run min/avg/max are computed from
     /// the responders. Default 3, clamped to a minimum of 1.
     pub queries_per_hop: u32,
-    /// How long to retain this monitor's traceroute runs before pruning, in
-    /// milliseconds. Replaces the fixed rollup windows for this monitor type.
-    pub retention_ms: u64,
+    /// How long to retain this monitor's traceroute runs before pruning, in hours.
+    /// When unset, falls back to the global default retention. Legacy `retention_ms`
+    /// in config files is accepted and converted to hours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_hours: Option<u64>,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
 }
@@ -266,8 +295,6 @@ fn default_true() -> bool { true }
 fn is_true(b: &bool) -> bool { *b }
 fn default_traceroute_max_hops() -> u32 { 30 }
 fn default_traceroute_queries() -> u32 { 3 }
-/// Default traceroute retention: 24 hours.
-pub fn default_traceroute_retention_ms() -> u64 { 86_400_000 }
 fn default_icmp_count() -> u32 { 3 }
 fn default_border_upstream() -> String { DEFAULT_BORDER_UPSTREAM.to_string() }
 fn default_http_method() -> String { "GET".to_string() }
@@ -312,6 +339,7 @@ struct RawHttpMonitorConfig {
     #[serde(default)] expected_status: Option<u16>,
     #[serde(default)] headers: HashMap<String, String>,
     #[serde(default)] body: Option<String>,
+    #[serde(default)] retention_hours: Option<u64>,
     #[serde(default = "default_true")] enabled: bool,
 }
 
@@ -327,6 +355,7 @@ impl From<RawHttpMonitorConfig> for HttpMonitorConfig {
             expected_status: r.expected_status,
             headers: r.headers,
             body: r.body,
+            retention_hours: r.retention_hours.filter(|&h| h > 0),
             enabled: r.enabled,
         }
     }
@@ -341,13 +370,15 @@ struct RawTcpMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default)] retention_hours: Option<u64>,
     #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawTcpMonitorConfig> for TcpMonitorConfig {
     fn from(r: RawTcpMonitorConfig) -> Self {
         let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
-        Self { name: r.name, host: r.host, port: r.port, interval_ms, timeout_ms, enabled: r.enabled }
+        Self { name: r.name, host: r.host, port: r.port, interval_ms, timeout_ms,
+               retention_hours: r.retention_hours.filter(|&h| h > 0), enabled: r.enabled }
     }
 }
 
@@ -360,6 +391,7 @@ struct RawIcmpMonitorConfig {
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
     #[serde(default)] count: Option<u32>,
+    #[serde(default)] retention_hours: Option<u64>,
     #[serde(default = "default_true")] enabled: bool,
 }
 
@@ -373,6 +405,7 @@ impl From<RawIcmpMonitorConfig> for IcmpMonitorConfig {
             interval_ms,
             timeout_ms,
             count: r.count.unwrap_or_else(default_icmp_count).max(1),
+            retention_hours: r.retention_hours.filter(|&h| h > 0),
         }
     }
 }
@@ -385,6 +418,7 @@ struct RawPublicIpMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default)] retention_hours: Option<u64>,
     #[serde(default = "default_true")] enabled: bool,
 }
 
@@ -397,6 +431,7 @@ impl From<RawPublicIpMonitorConfig> for PublicIpMonitorConfig {
             url: r.url.filter(|u| !u.trim().is_empty()),
             interval_ms,
             timeout_ms,
+            retention_hours: r.retention_hours.filter(|&h| h > 0),
             enabled: r.enabled,
         }
     }
@@ -411,6 +446,7 @@ struct RawBorderMonitorConfig {
     #[serde(default)] interval_secs: Option<u64>,
     #[serde(default)] timeout_ms: Option<u64>,
     #[serde(default)] timeout_secs: Option<u64>,
+    #[serde(default)] retention_hours: Option<u64>,
     #[serde(default = "default_true")] enabled: bool,
 }
 
@@ -426,6 +462,7 @@ impl From<RawBorderMonitorConfig> for BorderMonitorConfig {
                 .unwrap_or_else(default_border_upstream),
             interval_ms,
             timeout_ms,
+            retention_hours: r.retention_hours.filter(|&h| h > 0),
             enabled: r.enabled,
         }
     }
@@ -441,14 +478,22 @@ struct RawTracerouteMonitorConfig {
     #[serde(default)] timeout_secs: Option<u64>,
     #[serde(default)] max_hops: Option<u32>,
     #[serde(default)] queries_per_hop: Option<u32>,
+    /// Legacy field: retained for back-compat deserialization, converted to hours.
     #[serde(default)] retention_ms: Option<u64>,
     #[serde(default)] retention_secs: Option<u64>,
+    /// New unified field: wins over legacy `retention_ms` when both are present.
+    #[serde(default)] retention_hours: Option<u64>,
     #[serde(default = "default_true")] enabled: bool,
 }
 
 impl From<RawTracerouteMonitorConfig> for TracerouteMonitorConfig {
     fn from(r: RawTracerouteMonitorConfig) -> Self {
         let (interval_ms, timeout_ms) = resolve_timing(r.interval_ms, r.interval_secs, r.timeout_ms, r.timeout_secs);
+        // Unified retention: prefer the new `retention_hours`; fall back to the legacy
+        // `retention_ms`/`retention_secs` pair (converted to hours, minimum 1 h).
+        let legacy_ms = r.retention_ms.or_else(|| r.retention_secs.map(|s| s.saturating_mul(1000)));
+        let retention_hours = r.retention_hours.filter(|&h| h > 0)
+            .or_else(|| legacy_ms.map(|ms| (ms / 3_600_000).max(1)));
         Self {
             name: r.name,
             host: r.host,
@@ -457,7 +502,7 @@ impl From<RawTracerouteMonitorConfig> for TracerouteMonitorConfig {
             timeout_ms,
             max_hops: r.max_hops.unwrap_or_else(default_traceroute_max_hops).clamp(1, 64),
             queries_per_hop: r.queries_per_hop.unwrap_or_else(default_traceroute_queries).max(1),
-            retention_ms: resolve_ms(r.retention_ms, r.retention_secs, default_traceroute_retention_ms()),
+            retention_hours,
             enabled: r.enabled,
         }
     }
@@ -743,7 +788,43 @@ mod tests {
         );
         assert_eq!(c.max_hops, 30);
         assert_eq!(c.queries_per_hop, 3);
-        assert_eq!(c.retention_ms, 86_400_000);
+        // No explicit retention → None (falls back to global default at runtime)
+        assert_eq!(c.retention_hours, None);
+    }
+
+    #[test]
+    fn traceroute_legacy_retention_ms_converts_to_hours() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\nretention_ms = 86400000\n",
+        );
+        assert_eq!(c.retention_hours, Some(24));
+    }
+
+    #[test]
+    fn retention_hours_explicit_wins_over_legacy_ms() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\nretention_hours = 6\nretention_ms = 86400000\n",
+        );
+        assert_eq!(c.retention_hours, Some(6));
+    }
+
+    #[test]
+    fn retention_hours_accessor_falls_back_to_global() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\n",
+        );
+        let m = MonitorConfig::Traceroute(c);
+        // No per-monitor retention → uses global_days * 24
+        assert_eq!(m.retention_hours(90), 2160);
+    }
+
+    #[test]
+    fn retention_hours_accessor_uses_per_monitor_value() {
+        let c = parse_traceroute(
+            "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\nretention_hours = 6\n",
+        );
+        let m = MonitorConfig::Traceroute(c);
+        assert_eq!(m.retention_hours(90), 6);
     }
 
     #[test]
@@ -773,6 +854,7 @@ mod tests {
             monitors: vec![MonitorConfig::Http(HttpMonitorConfig {
                 name: "s".into(), url: "https://x".into(), interval_ms: 1000, timeout_ms: 1000,
                 method: "GET".into(), expected_status: None, headers: HashMap::new(), body: None,
+                retention_hours: None,
                 enabled: true,
             })],
         };

@@ -447,6 +447,101 @@ pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result
     Ok(result.rows_affected())
 }
 
+/// Delete probe_results for one monitor older than `cutoff_ms` (epoch ms).
+pub async fn prune_monitor_results(pool: &SqlitePool, monitor_name: &str, cutoff_ms: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM probe_results WHERE monitor_name = ? AND checked_at < ?")
+        .bind(monitor_name)
+        .bind(cutoff_ms)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete rollup rows for one monitor older than `cutoff_epoch` (epoch seconds).
+pub async fn prune_monitor_rollups(pool: &SqlitePool, monitor_name: &str, cutoff_epoch: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM probe_rollup_1m WHERE monitor_name = ? AND bucket_epoch < ?")
+        .bind(monitor_name)
+        .bind(cutoff_epoch)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// The earliest and latest probe times (epoch ms) for a monitor. Used to
+/// supply brush bounds on the detail page. Returns None when there is no data.
+pub async fn get_probe_extent(pool: &SqlitePool, monitor_name: &str) -> Result<Option<(i64, i64)>> {
+    let row = sqlx::query(
+        "SELECT MIN(checked_at) AS lo, MAX(checked_at) AS hi FROM probe_results WHERE monitor_name = ?",
+    )
+    .bind(monitor_name)
+    .fetch_one(pool)
+    .await?;
+    let lo: Option<i64> = row.try_get("lo")?;
+    let hi: Option<i64> = row.try_get("hi")?;
+    Ok(match (lo, hi) {
+        (Some(lo), Some(hi)) => Some((lo, hi)),
+        _ => None,
+    })
+}
+
+/// A collapsed state run — a contiguous span where the probe's leading detail
+/// token (the IP for public-IP monitors; the fault class for border) was the
+/// same value. Null state means the monitor was down/no detail for that span.
+#[derive(Debug, Serialize)]
+pub struct StateSegment {
+    pub state: Option<String>,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// Return collapsed state segments for a monitor over `[from_ms, to_ms]`, scanning
+/// ascending and merging consecutive rows that share the same leading detail token.
+/// The result is bounded by the number of state *changes*, not the number of probes,
+/// so a fast monitor's full window is covered regardless of probe frequency.
+pub async fn get_state_segments(
+    pool: &SqlitePool,
+    monitor_name: &str,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<StateSegment>> {
+    let rows = sqlx::query(
+        "SELECT detail, checked_at FROM probe_results
+         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
+         ORDER BY checked_at ASC",
+    )
+    .bind(monitor_name)
+    .bind(from_ms)
+    .bind(to_ms)
+    .fetch_all(pool)
+    .await?;
+
+    let mut segs: Vec<StateSegment> = Vec::new();
+    for row in &rows {
+        let detail: Option<String> = row.try_get("detail")?;
+        let t: i64 = row.try_get("checked_at")?;
+        // Leading token of detail: the IP address for publicip, fault class for border.
+        let state = detail.as_deref()
+            .and_then(|d| d.trim().split_whitespace().next())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match segs.last_mut() {
+            Some(last) if last.state == state => {
+                last.end_ms = t;
+            }
+            _ => {
+                if let Some(last) = segs.last_mut() {
+                    last.end_ms = t;
+                }
+                segs.push(StateSegment { state, start_ms: t, end_ms: t });
+            }
+        }
+    }
+    if let Some(last) = segs.last_mut() {
+        last.end_ms = to_ms;
+    }
+    Ok(segs)
+}
+
 /// Delete all stored probe results (and rollups) for a monitor. Returns the
 /// number of raw rows removed.
 pub async fn delete_results(pool: &SqlitePool, monitor_name: &str) -> Result<u64> {

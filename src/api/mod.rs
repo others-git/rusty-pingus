@@ -24,6 +24,9 @@ pub struct AppState {
     pub monitors: MonitorStore,
     /// In-process fan-out of live status updates to connected SSE clients.
     pub updates: broadcast::Sender<StatusUpdate>,
+    /// Global retention in days (from config.toml), used as the fallback when a
+    /// monitor has no per-monitor `retention_hours`.
+    pub global_retention_days: u64,
 }
 
 // ── Live status updates (SSE) ─────────────────────────────────────────────────
@@ -99,6 +102,9 @@ pub struct MonitorStatus {
     pub detail: Option<String>,
     pub uptime_24h: Option<f64>,
     pub enabled: bool,
+    /// Per-monitor retention in hours. None means the global default applies
+    /// (the frontend should fall back to `global_retention_days × 24`).
+    pub retention_hours: Option<u64>,
 }
 
 pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
@@ -124,12 +130,22 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
         let protocol = m.protocol().to_string();
         let endpoint = m.endpoint();
         let enabled = m.enabled();
+        // Raw per-monitor retention (None → global default applies at the frontend).
+        let retention_hours = match m {
+            crate::monitors::MonitorConfig::Http(c) => c.retention_hours,
+            crate::monitors::MonitorConfig::Tcp(c) => c.retention_hours,
+            crate::monitors::MonitorConfig::Icmp(c) => c.retention_hours,
+            crate::monitors::MonitorConfig::PublicIp(c) => c.retention_hours,
+            crate::monitors::MonitorConfig::Border(c) => c.retention_hours,
+            crate::monitors::MonitorConfig::Traceroute(c) => c.retention_hours,
+        };
         match latest.get(&name) {
             Some(s) => result.push(MonitorStatus {
                 uptime_24h: uptime.get(&name).copied(),
                 protocol,
                 endpoint,
                 enabled,
+                retention_hours,
                 status: s.status.clone(),
                 last_checked_at: Some(s.checked_at.clone()),
                 response_time_ms: s.response_time_ms,
@@ -142,6 +158,7 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
                 protocol,
                 endpoint,
                 enabled,
+                retention_hours,
                 status: "pending".to_string(),
                 last_checked_at: None,
                 response_time_ms: None,
@@ -283,6 +300,67 @@ pub async fn monitor_traceroute_extent(
         Ok(None) => Json(serde_json::json!({ "from": null, "to": null })).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "DB error in monitor_traceroute_extent");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
+        }
+    }
+}
+
+// ── State-timeline segments + probe extent ────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SegmentsParams {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// `GET /api/monitors/:name/segments?from&to` — collapsed state segments for
+/// public-IP/border timelines, server-side, so the full window is covered
+/// regardless of probe frequency (bounded by changes, not probe count).
+pub async fn monitor_segments(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<SegmentsParams>,
+) -> impl IntoResponse {
+    let to = params.to.unwrap_or_else(Utc::now);
+    let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
+    match db::get_state_segments(&state.pool, &name, from.timestamp_millis(), to.timestamp_millis()).await {
+        Ok(segs) => Json(segs).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "DB error in monitor_segments");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
+        }
+    }
+}
+
+/// `GET /api/monitors/:name/extent` — earliest/latest probe times and the
+/// monitor's effective retention (hours), so the detail-page brush knows its
+/// bounds. Works for all monitor types (use traceroute/extent for traceroute).
+pub async fn monitor_extent(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let retention_hours = state.monitors.list().await.iter()
+        .find(|m| m.name() == name)
+        .map(|m| m.retention_hours(state.global_retention_days))
+        .unwrap_or(state.global_retention_days.saturating_mul(24));
+
+    let ms_to_iso = |ms: i64| {
+        DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
+    };
+
+    match db::get_probe_extent(&state.pool, &name).await {
+        Ok(Some((lo, hi))) => Json(serde_json::json!({
+            "from": ms_to_iso(lo),
+            "to": ms_to_iso(hi),
+            "retention_hours": retention_hours,
+        })).into_response(),
+        Ok(None) => Json(serde_json::json!({
+            "from": null,
+            "to": null,
+            "retention_hours": retention_hours,
+        })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "DB error in monitor_extent");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
         }
     }

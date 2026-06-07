@@ -10,7 +10,7 @@ mod tests {
     use super::*;
 
     fn cfg(host: &str, port: u16, timeout_ms: u64) -> TcpMonitorConfig {
-        TcpMonitorConfig { name: "test".into(), host: host.into(), port, interval_ms: 60_000, timeout_ms, enabled: true }
+        TcpMonitorConfig { name: "test".into(), host: host.into(), port, interval_ms: 60_000, timeout_ms, retention_hours: None, enabled: true }
     }
 
     #[tokio::test]

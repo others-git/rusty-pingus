@@ -2,6 +2,16 @@
 // dependency-free so both the dashboard and the detail page can reuse it.
 window.RP = window.RP || {};
 
+// Returns true when a traceroute monitor is down because it couldn't open a raw
+// socket — i.e. it needs CAP_NET_RAW / elevated privileges.
+// Coupled to probe/traceroute.rs reason strings; update both together.
+window.RP.isTraceUnavailable = function (protocol, status, failureReason) {
+  if (protocol !== 'traceroute' || status !== 'down') return false;
+  return failureReason === 'privilege_error'
+      || failureReason === 'socket_error'
+      || failureReason === 'join_error';
+};
+
 // "x ago" from an ISO timestamp. (Was duplicated verbatim in both pages.)
 window.RP.formatRelative = function (iso) {
   const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);

@@ -39,6 +39,11 @@ function monitorDetail() {
   let traceTimer = null;
   let traceApplying = false; // guard: programmatic brush setOption must not refetch
   let hopChart = null;       // the per-hop latency graph (min–max band + avg line)
+  // Non-traceroute detail brush (retention-bounded range selector, replaces
+  // fixed 1h/24h/7d/30d buttons). Same pattern as the traceroute brush.
+  let detailBrush = null;
+  let detailBrushApplying = false;
+  let detailBrushTimer = null;
 
   return {
     monitorName: decodeURIComponent(location.pathname.replace(/^\/monitors\//, '')),
@@ -48,6 +53,7 @@ function monitorDetail() {
     lastResponseMs: null,
     lastCheckedAt: null,
     detail: null,
+    failureReason: null,
     uptime24h: null,
     sampleCount: 0,
     lossCount: 0,
@@ -73,6 +79,11 @@ function monitorDetail() {
       { label: '7d',  key: 'uptime_7d',  value: null },
       { label: '30d', key: 'uptime_30d', value: null },
     ],
+    retentionHours: null,    // this monitor's effective retention (hours)
+    detailFrom: null,        // ms; active brush start
+    detailTo: null,          // ms; active brush end
+    detailExtentFrom: null,  // ms; oldest retained data
+    detailExtentTo: null,    // ms; newest retained data (live edge)
 
     async init() {
       document.title = `${this.monitorName} — Rusty Pingus`;
@@ -94,6 +105,7 @@ function monitorDetail() {
       this.lastResponseMs = latest ? latest.response_time_ms : null;
       this.lastCheckedAt = latest ? latest.checked_at : null;
       this.detail = latest ? latest.detail : null;
+      this.failureReason = latest ? (latest.failure_reason ?? null) : null;
       // Anchor windows to the newest server-recorded probe time (falls back to
       // the browser clock only while there is no data).
       if (latest) this._bumpServerNow(latest.checked_at);
@@ -105,7 +117,8 @@ function monitorDetail() {
       if (this.isTraceroute) {
         this.$nextTick(() => this._initTraceroute());
       } else {
-        this.$nextTick(() => this.selectWindow(this.activeWindow));
+        await this._loadExtent();
+        this.$nextTick(() => this._initDetailBrush());
       }
 
       // Stay current as probes arrive (matches the dashboard): subscribe to the
@@ -137,6 +150,7 @@ function monitorDetail() {
       this.lastResponseMs = u.response_time_ms;
       this.lastCheckedAt = u.last_checked_at;
       this.detail = u.detail;
+      this.failureReason = u.failure_reason ?? null;
       this._bumpServerNow(u.last_checked_at); // advance the anchor with fresh data
     },
 
@@ -186,18 +200,18 @@ function monitorDetail() {
     // it to include "now" so fresh probes appear; if the user has zoomed/panned,
     // keep their exact range (and position).
     _refreshVisible() {
-      if (windowFrom == null) return;                 // window not initialized yet
-      if (!chart) { this.selectWindow(this.activeWindow); return; }
+      if (windowFrom == null) return;
+      if (!chart) { this._scheduleDetailLive(); return; }
       const dz = (chart.getOption().dataZoom || [])[0] || {};
       const start = dz.start ?? 0, end = dz.end ?? 100;
       const atFull = start <= 0.05 && end >= 99.95;
       if (atFull) {
-        this.selectWindow(this.activeWindow);         // slides to now; view stays full
+        this._scheduleDetailLive();
       } else {
         const span = windowTo - windowFrom;
         const fromMs = windowFrom + span * (start / 100);
         const toMs = windowFrom + span * (end / 100);
-        this.loadRange(fromMs, toMs, false);          // preserve zoom/pan position
+        this.loadRange(fromMs, toMs, false);
       }
     },
 
@@ -227,6 +241,7 @@ function monitorDetail() {
       this._stopPoll();
       if (liveRefreshTimer) { clearTimeout(liveRefreshTimer); liveRefreshTimer = null; }
       if (traceTimer) { clearTimeout(traceTimer); traceTimer = null; }
+      if (detailBrushTimer) { clearTimeout(detailBrushTimer); detailBrushTimer = null; }
     },
 
     // Select a window: it fixes the chart's time axis and loads the window's data.
@@ -249,20 +264,21 @@ function monitorDetail() {
       const seq = ++refetchSeq;
       this.isLoadingDetail = true;
       try {
-        // Public-IP and border monitors render a state timeline, not a response
-        // line. That needs the per-probe `detail` (the IP / fault class), so we
-        // always read raw history for them.
+        // Public-IP and border monitors render a state timeline via the server-
+        // collapsed segments endpoint (no row-count cap, spans the full window).
         if (this.timelineKind) {
-          const histUrl = `/api/monitors/${name}/history?from=${encodeURIComponent(fromIso)}`
-            + `&to=${encodeURIComponent(toIso)}&limit=${RAW_LIMIT}`;
-          const rows = await (await fetch(histUrl)).json().catch(() => []);
+          const segUrl = `/api/monitors/${name}/segments?from=${encodeURIComponent(fromIso)}`
+            + `&to=${encodeURIComponent(toIso)}`;
+          const serverSegs = await (await fetch(segUrl)).json().catch(() => []);
           if (seq !== refetchSeq) return;
-          if (rows[0]) this._bumpServerNow(rows[0].checked_at); // rows are newest-first
-          const asc = [...rows].reverse();
-          this.sampleCount = rows.length;
-          tlSegments = buildSegments(asc, to, this.timelineKind, tlColorMap);
-          // Remember the value currently on screen so live events can detect a
-          // real change and only then reload the timeline (no per-probe flashing).
+          this.sampleCount = serverSegs.length;
+          tlSegments = serverSegs.map(s => ({
+            state: s.state,
+            start: s.start_ms,
+            end: s.end_ms,
+            color: colorForState(this.timelineKind, s.state, tlColorMap),
+            label: stateLabel(this.timelineKind, s.state),
+          }));
           lastTimelineValue = tlSegments.length ? tlSegments[tlSegments.length - 1].state : null;
           this.tlLegend = buildLegend(tlSegments);
           this.lossCount = 0;
@@ -554,8 +570,125 @@ function monitorDetail() {
     },
 
     resetZoom() {
-      // Back to the full active window (also reloads it at window resolution).
-      this.selectWindow(this.activeWindow);
+      if (this.detailExtentFrom != null && this.detailExtentTo != null) {
+        this.detailFrom = this.detailExtentFrom;
+        this.detailTo = this.detailExtentTo;
+        windowFrom = this.detailFrom;
+        windowTo = this.detailTo;
+        this.loadRange(this.detailFrom, this.detailTo, true);
+        this._renderDetailBrush();
+      }
+    },
+
+    // ── Detail-page extent + brush (non-traceroute monitors) ─────────────────
+    async _loadExtent() {
+      const name = encodeURIComponent(this.monitorName);
+      try {
+        const ext = await (await fetch(`/api/monitors/${name}/extent`)).json();
+        this.retentionHours = ext.retention_hours ?? null;
+        this.detailExtentFrom = (ext.from && ext.from !== ext.to) ? Date.parse(ext.from) : null;
+        this.detailExtentTo = ext.to ? Date.parse(ext.to) : null;
+      } catch (e) { /* no data yet; bounds stay null */ }
+    },
+
+    async _initDetailBrush() {
+      const now = this._anchorMs();
+      const retMs = (this.retentionHours ?? 2160) * 3_600_000;
+      const hi = this.detailExtentTo ?? now;
+      const lo = this.detailExtentFrom ?? (hi - retMs);
+      this.detailExtentTo = hi;
+      this.detailExtentFrom = lo;
+      this.detailFrom = lo;
+      this.detailTo = hi;
+      windowFrom = lo;
+      windowTo = hi;
+      await this.loadRange(lo, hi, true);
+      this.$nextTick(() => this._renderDetailBrush());
+    },
+
+    _renderDetailBrush() {
+      const el = document.getElementById('detail-brush');
+      if (!el || !window.echarts) return;
+      const self = this;
+      const lo = this.detailExtentFrom ?? (this._anchorMs() - (this.retentionHours ?? 2160) * 3_600_000);
+      const hi = this.detailExtentTo ?? this._anchorMs();
+      const clamp = (x) => Math.max(0, Math.min(100, x));
+      const span = Math.max(1, hi - lo);
+
+      if (!detailBrush) {
+        detailBrush = echarts.init(el);
+        window.addEventListener('resize', () => detailBrush && detailBrush.resize());
+        detailBrush.on('datazoom', () => {
+          if (detailBrushApplying) return;
+          const dz = (detailBrush.getOption().dataZoom || [])[0] || {};
+          const lo2 = self.detailExtentFrom ?? lo;
+          const hi2 = self.detailExtentTo ?? hi;
+          const span2 = Math.max(1, hi2 - lo2);
+          self.detailFrom = lo2 + span2 * ((dz.start ?? 0) / 100);
+          self.detailTo = lo2 + span2 * ((dz.end ?? 100) / 100);
+          windowFrom = self.detailFrom;
+          windowTo = self.detailTo;
+          if (detailBrushTimer) clearTimeout(detailBrushTimer);
+          detailBrushTimer = setTimeout(() => self.loadRange(self.detailFrom, self.detailTo, true), 300);
+        });
+      }
+
+      const startPct = clamp(((this.detailFrom - lo) / span) * 100);
+      const endPct = clamp(((this.detailTo - lo) / span) * 100);
+      detailBrushApplying = true;
+      detailBrush.setOption({
+        backgroundColor: 'transparent',
+        // Collapse the grid to 0 height — we only want the slider, no chart area.
+        grid: { top: 0, left: 0, right: 0, height: 0 },
+        xAxis: { type: 'time', min: lo, max: hi, show: false },
+        yAxis: { type: 'value', show: false, min: 0, max: 1 },
+        dataZoom: [
+          { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
+          { type: 'slider', xAxisIndex: 0, filterMode: 'none',
+            top: 2, height: 36, left: 4, right: 4,
+            showDataShadow: false,
+            start: startPct, end: endPct,
+            borderColor: '#334155', fillerColor: 'rgba(34,211,238,0.15)',
+            textStyle: { color: '#94a3b8', fontSize: 10 },
+            handleStyle: { color: '#22d3ee' },
+            moveHandleStyle: { color: '#22d3ee' } },
+        ],
+        series: [],
+      }, { notMerge: false });
+      detailBrushApplying = false;
+    },
+
+    _scheduleDetailLive() {
+      const now = this._anchorMs();
+      const live = this.detailTo == null || this.detailExtentTo == null
+        || this.detailTo >= this.detailExtentTo - 1000;
+      this.detailExtentTo = Math.max(this.detailExtentTo ?? now, now);
+      if (this.detailExtentFrom == null) this.detailExtentFrom = now;
+      if (!live) return;
+      const span = (this.detailTo ?? 0) - (this.detailFrom ?? 0);
+      this.detailTo = this.detailExtentTo;
+      this.detailFrom = span > 0 ? this.detailTo - span : this.detailExtentFrom;
+      windowFrom = this.detailFrom;
+      windowTo = this.detailTo;
+      if (detailBrushTimer) clearTimeout(detailBrushTimer);
+      detailBrushTimer = setTimeout(() => {
+        this.loadRange(this.detailFrom, this.detailTo, false);
+        this._renderDetailBrush();
+      }, 300);
+    },
+
+    detailRangeLabel() {
+      if (this.detailFrom == null || this.detailTo == null) return '';
+      const f = new Date(this.detailFrom).toLocaleString();
+      const t = new Date(this.detailTo).toLocaleString();
+      return `${f} → ${t}`;
+    },
+
+    retentionLabel() {
+      const h = this.retentionHours;
+      if (h == null) return null;
+      if (h % 24 === 0) return `${h / 24}d`;
+      return `${h}h`;
     },
 
     // ── Traceroute view ───────────────────────────────────────────────────────
@@ -638,26 +771,21 @@ function monitorDetail() {
       traceApplying = true;
       traceBrush.setOption({
         backgroundColor: 'transparent',
-        grid: { left: 8, right: 8, top: 6, bottom: 26 },
-        xAxis: {
-          type: 'time', min: lo, max: hi,
-          axisLine: { lineStyle: { color: '#334155' } },
-          axisLabel: { color: '#64748b', fontSize: 10, hideOverlap: true },
-          splitLine: { show: false },
-        },
+        grid: { top: 0, left: 0, right: 0, height: 0 },
+        xAxis: { type: 'time', min: lo, max: hi, show: false },
         yAxis: { type: 'value', show: false, min: 0, max: 1 },
         dataZoom: [
           { type: 'inside', xAxisIndex: 0, filterMode: 'none' },
-          { type: 'slider', xAxisIndex: 0, filterMode: 'none', height: 18, bottom: 2,
+          { type: 'slider', xAxisIndex: 0, filterMode: 'none',
+            top: 2, height: 36, left: 4, right: 4,
+            showDataShadow: false,
             start: startPct, end: endPct,
             borderColor: '#334155', fillerColor: 'rgba(34,211,238,0.15)',
-            dataBackground: { lineStyle: { color: '#334155' }, areaStyle: { color: '#1e293b' } },
-            textStyle: { color: '#64748b' }, handleStyle: { color: '#22d3ee' } },
+            textStyle: { color: '#94a3b8', fontSize: 10 },
+            handleStyle: { color: '#22d3ee' },
+            moveHandleStyle: { color: '#22d3ee' } },
         ],
-        series: [{
-          type: 'line', showSymbol: false, lineStyle: { width: 0 },
-          areaStyle: { color: 'rgba(34,211,238,0.08)' }, data: [[lo, 1], [hi, 1]],
-        }],
+        series: [],
       }, { notMerge: false });
       traceApplying = false;
     },
@@ -700,12 +828,22 @@ function monitorDetail() {
         hopChart.resize(); // the spanning cell's height changes with hop count
       }
 
+      // Axis is centered at 0: left side = -min_ms, right side = +max_ms.
+      // maxX is the larger of the two extents so the axis is symmetric.
       let maxX = 0;
-      for (const h of hops) { const v = h.max_ms ?? h.avg_ms ?? 0; if (v > maxX) maxX = v; }
+      for (const h of hops) {
+        const lo = h.min_ms ?? 0;
+        const hi = h.max_ms ?? h.avg_ms ?? 0;
+        if (lo > maxX) maxX = lo;
+        if (hi > maxX) maxX = hi;
+      }
       maxX = maxX > 0 ? maxX * 1.1 : 1;
 
       const cats = hops.map(h => String(h.hop_no));
-      const bandData = hops.map((h, i) => [h.min_ms, h.max_ms, i]);
+      // bandData: [-min_ms, +max_ms, hopIndex] — negative x for the min (left) side.
+      // One item per hop so the axis-trigger tooltip fires per-hop; the ribbon is
+      // built all at once in the first renderItem call using the hops closure.
+      const bandData = hops.map((h, i) => [-(h.min_ms ?? 0), h.max_ms ?? 0, i]);
       const avgData = hops.map(h => h.avg_ms ?? null);
       const fmt = (v) => v == null ? '—' : (v < 10 ? v.toFixed(2) : Math.round(v).toLocaleString()) + ' ms';
 
@@ -721,7 +859,8 @@ function monitorDetail() {
               + `avg ${fmt(h.avg_ms)}<br/>min ${fmt(h.min_ms)} · max ${fmt(h.max_ms)}`;
           },
         },
-        xAxis: { type: 'value', min: 0, max: maxX, show: false },
+        // Symmetric axis: [-maxX, +maxX] with 0 at center.
+        xAxis: { type: 'value', min: -maxX, max: maxX, show: false },
         yAxis: {
           type: 'category', inverse: true, data: cats, boundaryGap: true,
           show: false, axisLine: { show: false }, axisTick: { show: false },
@@ -730,27 +869,61 @@ function monitorDetail() {
           {
             type: 'custom', z: 1, encode: { x: [0, 1], y: 2 }, data: bandData,
             renderItem: (params, api) => {
-              const min = api.value(0), max = api.value(1), idx = api.value(2);
-              if (min == null || max == null || isNaN(min) || isNaN(max)) return;
-              const p1 = api.coord([min, idx]);
-              const p2 = api.coord([max, idx]);
-              const h = 7;
-              return {
-                type: 'rect',
-                shape: { x: p1[0], y: p1[1] - h / 2, width: Math.max(2, p2[0] - p1[0]), height: h, r: 3 },
-                style: { fill: 'rgba(34,211,238,0.22)' },
-              };
+              // Build all ribbon polygons on the first item; subsequent items are
+              // no-ops (data is still present for per-hop tooltip triggering).
+              if (params.dataIndex !== 0) return { type: 'group', children: [] };
+              const MIN_PX = 2; // ensure min==max hops still show a sliver
+              // Collect contiguous runs of responding hops; break at non-responders.
+              // Left edge at x=-min_ms (negative), right edge at x=+max_ms (positive).
+              const segments = [];
+              let run = [];
+              for (let i = 0; i < hops.length; i++) {
+                const h = hops[i];
+                if (h.min_ms != null && h.max_ms != null) {
+                  const pLeft = api.coord([-h.min_ms, i]);
+                  const pRight = api.coord([h.max_ms, i]);
+                  run.push({ x1: pLeft[0], x2: Math.max(pLeft[0] + MIN_PX, pRight[0]), y: pLeft[1] });
+                } else {
+                  if (run.length) { segments.push(run); run = []; }
+                }
+              }
+              if (run.length) segments.push(run);
+              // Each contiguous run becomes one filled polygon: down the left (min)
+              // edge top→bottom, then back up the right (max) edge bottom→top, closed.
+              const children = segments.map(seg => ({
+                type: 'polygon',
+                shape: {
+                  points: [
+                    ...seg.map(p => [p.x1, p.y]),
+                    ...[...seg].reverse().map(p => [p.x2, p.y]),
+                  ],
+                },
+                style: { fill: 'rgba(34,211,238,0.20)', stroke: 'rgba(34,211,238,0.35)', lineWidth: 0.5 },
+              }));
+              return { type: 'group', children };
             },
           },
           {
+            // Average dots at +avg_ms (positive side of centered axis).
+            // markLine at x=0 provides the visual centre reference.
             type: 'line', z: 2, data: avgData, connectNulls: false,
             symbol: 'circle', symbolSize: 8, showSymbol: true,
             lineStyle: { color: '#22d3ee', width: 2 }, itemStyle: { color: '#22d3ee' },
+            markLine: {
+              silent: true, symbol: 'none',
+              lineStyle: { color: '#475569', width: 1, type: 'solid', opacity: 0.6 },
+              label: { show: false },
+              data: [{ xAxis: 0 }],
+            },
           },
         ],
       }, { notMerge: true });
       hopChart.resize();
     },
+    get isTraceUnavailable() {
+      return window.RP.isTraceUnavailable('traceroute', this.currentStatus, this.failureReason);
+    },
+
     traceFmtMs(v) {
       if (v == null) return '—';
       return (v < 10 ? v.toFixed(1) : Math.round(v).toLocaleString()) + ' ms';

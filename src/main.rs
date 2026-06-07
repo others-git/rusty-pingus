@@ -137,13 +137,16 @@ async fn async_main(
     // drops oldest events and is reconciled by the dashboard's periodic poll.
     let (updates_tx, _) = tokio::sync::broadcast::channel(256);
 
-    // Clone the store for the traceroute prune loop before it moves into state.
-    let traceroute_store = monitor_store.clone();
+    let global_retention_days = cfg.defaults.retention_days.unwrap_or(config::DEFAULT_RETENTION_DAYS);
+
+    // Clone the store for the per-monitor retention loop before it moves into state.
+    let retention_store = monitor_store.clone();
 
     let state = AppState {
         pool: pool.clone(),
         monitors: monitor_store,
         updates: updates_tx.clone(),
+        global_retention_days,
     };
 
     let sched_handle = {
@@ -159,24 +162,15 @@ async fn async_main(
     };
 
     let retention_handle = {
-        let days = cfg.defaults.retention_days.unwrap_or(config::DEFAULT_RETENTION_DAYS);
         let pool = pool.clone();
         let cancel = cancel.clone();
-        Some(tokio::spawn(async move {
-            scheduler::retention_loop(pool, days, cancel).await;
-        }))
+        tokio::spawn(scheduler::per_monitor_retention_loop(pool, retention_store, global_retention_days, cancel))
     };
 
     let rollup_handle = {
         let pool = pool.clone();
         let cancel = cancel.clone();
         tokio::spawn(scheduler::rollup_loop(pool, cancel))
-    };
-
-    let traceroute_retention_handle = {
-        let pool = pool.clone();
-        let cancel = cancel.clone();
-        tokio::spawn(scheduler::traceroute_retention_loop(pool, traceroute_store, cancel))
     };
 
     #[cfg(not(windows))]
@@ -198,9 +192,8 @@ async fn async_main(
     let drain = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let _ = sched_handle.await;
         let _ = web_handle.await;
-        if let Some(h) = retention_handle { let _ = h.await; }
+        let _ = retention_handle.await;
         let _ = rollup_handle.await;
-        let _ = traceroute_retention_handle.await;
     });
     if drain.await.is_err() { tracing::warn!("Drain timeout exceeded"); }
 
