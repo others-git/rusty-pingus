@@ -84,6 +84,7 @@ function monitorDetail() {
     detailTo: null,          // ms; active brush end
     detailExtentFrom: null,  // ms; oldest retained data
     detailExtentTo: null,    // ms; newest retained data (live edge)
+    borderEndpoint: '',      // "ip1 → ip2 → ip3"; populated from config on load, real IPs via SSE
 
     async init() {
       document.title = `${this.monitorName} — Rusty Pingus`;
@@ -112,6 +113,7 @@ function monitorDetail() {
       const proto = latest ? latest.protocol : null;
       this.timelineKind = (proto === 'publicip' || proto === 'border') ? proto : '';
       this.isTraceroute = proto === 'traceroute';
+      if (this.timelineKind === 'border') this.borderEndpoint = (latest && latest.endpoint) || '';
 
       this.loading = false;
       if (this.isTraceroute) {
@@ -151,6 +153,7 @@ function monitorDetail() {
       this.lastCheckedAt = u.last_checked_at;
       this.detail = u.detail;
       this.failureReason = u.failure_reason ?? null;
+      if (u.endpoint && this.timelineKind === 'border') this.borderEndpoint = u.endpoint;
       this._bumpServerNow(u.last_checked_at); // advance the anchor with fresh data
     },
 
@@ -390,6 +393,37 @@ function monitorDetail() {
       }
       this.ipChanges = changes;
       this.ipDistinct = seen.size;
+    },
+
+    // Decompose borderEndpoint into per-hop display objects for the network path panel.
+    // Endpoint formats (→-separated):
+    //   2 hops: local_gw → upstream             (no public hop detected)
+    //   3 hops: local_gw → isp_gw → upstream    (full path)
+    // local_gw is the last private hop (LAN edge → "Local GW"); isp_gw is the first
+    // public hop (ISP gateway → "Border GW").
+    borderHops() {
+      const hops = this.borderEndpoint
+        ? this.borderEndpoint.split(' → ').map(s => s.trim())
+        : [];
+      if (!hops.length) return [];
+      const rtts = parseBorderRtts(this.detail);
+      const fr = this.failureReason; // null | 'lan_down' | 'isp_gw_down' | 'isp_down'
+      const localSt = fr === 'lan_down' ? 'down' : 'up';
+      const upSt = fr == null ? 'up' : (fr === 'isp_down' ? 'down' : 'unknown');
+      if (hops.length >= 3) {
+        // local_gw → isp_gw → upstream
+        const ispSt = fr === 'lan_down' ? 'unknown' : (fr === 'isp_gw_down' ? 'down' : 'up');
+        return [
+          { label: 'Local GW',  ip: hops[0], rtt: rtts.local,    status: localSt },
+          { label: 'Border GW', ip: hops[1], rtt: rtts.isp,      status: ispSt   },
+          { label: 'Upstream',  ip: hops[2], rtt: rtts.upstream, status: upSt    },
+        ];
+      }
+      // 2 hops: local_gw → upstream (no public hop detected)
+      return [
+        { label: 'Local GW',  ip: hops[0],               rtt: rtts.local,    status: localSt },
+        { label: 'Upstream',  ip: hops[hops.length - 1],  rtt: rtts.upstream, status: upSt    },
+      ];
     },
 
     // A state timeline: each segment fills the span a value was in effect (an IP
@@ -964,8 +998,8 @@ const IP_PALETTE = [
 ];
 const UNKNOWN_COLOR = '#475569'; // gray for down / no recorded state
 // Border fault classes get semantic colors and human labels (not a palette).
-const BORDER_COLORS = { ok: '#34d399', isp_down: '#fbbf24', lan_down: '#f87171' };
-const BORDER_LABELS = { ok: 'OK', isp_down: 'ISP down', lan_down: 'LAN down' };
+const BORDER_COLORS = { ok: '#34d399', isp_gw_down: '#fb923c', isp_down: '#fbbf24', lan_down: '#f87171' };
+const BORDER_LABELS = { ok: 'OK', isp_gw_down: 'Border GW down', isp_down: 'ISP down', lan_down: 'LAN down' };
 
 // The state a probe recorded: the leading token of its detail (the IP for
 // public-IP; the fault class for border, which may carry a "—"/RTT suffix).
@@ -1023,6 +1057,17 @@ function buildLegend(segs) {
     m.set(s.label, cur);
   }
   return [...m.values()];
+}
+
+// Extract per-hop RTTs from a border detail string.
+// Format: "ok (local 2ms, isp 8ms, upstream 15ms)" or "lan_down — … (local —, …)"
+function parseBorderRtts(detail) {
+  if (!detail) return { local: null, isp: null, upstream: null };
+  const num = (key) => {
+    const m = detail.match(new RegExp(key + '\\s+(\\d+)ms'));
+    return m ? parseInt(m[1], 10) : null;
+  };
+  return { local: num('local'), isp: num('isp'), upstream: num('upstream') };
 }
 
 function fmtDuration(ms) {

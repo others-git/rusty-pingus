@@ -214,6 +214,48 @@
       </div>
     </section>
 
+    <!-- ── Border monitor: network path (gateway topology) ──────────────── -->
+    <section x-show="timelineKind === 'border'" class="bg-slate-800 border border-slate-700 rounded-xl p-5">
+      <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 mb-4">Network Path</h2>
+      <div class="flex items-center gap-3 flex-wrap">
+        <template x-for="(hop, i) in borderHops()" :key="i">
+          <div class="flex items-center gap-3">
+            <div class="flex flex-col items-center gap-1 px-4 py-3 rounded-xl border min-w-[7rem] text-center"
+                 :class="{
+                   'bg-emerald-950/30 border-emerald-800/50': hop.status === 'up',
+                   'bg-red-950/30 border-red-800/50':         hop.status === 'down',
+                   'bg-slate-900 border-slate-700':            hop.status === 'unknown',
+                 }">
+              <div class="flex items-center gap-1.5 mb-0.5">
+                <span class="w-1.5 h-1.5 rounded-full shrink-0"
+                      :class="{
+                        'bg-emerald-400': hop.status === 'up',
+                        'bg-red-400':     hop.status === 'down',
+                        'bg-slate-600':   hop.status === 'unknown',
+                      }"></span>
+                <span class="text-[10px] font-semibold uppercase tracking-wider text-slate-400" x-text="hop.label"></span>
+              </div>
+              <span class="font-mono text-sm font-bold leading-tight"
+                    :class="{
+                      'text-emerald-300': hop.status === 'up',
+                      'text-red-300':     hop.status === 'down',
+                      'text-slate-400':   hop.status === 'unknown',
+                    }"
+                    x-text="hop.ip === 'auto' ? 'detecting…' : hop.ip"></span>
+              <span class="text-xs mt-0.5"
+                    :class="hop.rtt != null ? 'text-slate-400' : 'text-slate-600'"
+                    x-text="hop.rtt != null ? hop.rtt + ' ms' : '—'"></span>
+            </div>
+            <i x-show="i < borderHops().length - 1"
+               class="fa-solid fa-arrow-right text-slate-600 shrink-0"></i>
+          </div>
+        </template>
+        <div x-show="borderHops().length === 0" class="text-slate-500 text-sm py-2">
+          <i class="fa-solid fa-circle-notch fa-spin mr-1.5"></i>Detecting gateways…
+        </div>
+      </div>
+    </section>
+
     <!-- ── Time-range brush (non-traceroute) ─────────────────────────────── -->
     <section x-show="!isTraceroute" class="bg-slate-800 border border-slate-700 rounded-xl p-5">
       <div class="flex items-center justify-between mb-3">

@@ -1,0 +1,24 @@
+# rusty-pingus reference compose stack.
+# Run from the repo root:   docker compose -f environment/docker-compose.yml up
+# Or from this directory:   docker compose up
+#
+# Before starting, create a config/ directory next to this file and copy
+# config.toml + monitors.toml from the repo root into it.
+
+services:
+  rusty-pingus:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    ports:
+      - "${BIND_PORT:-8080}:${BIND_PORT:-8080}"
+    volumes:
+      # Place config.toml and monitors.toml inside ./config/ before starting.
+      - ./config:/config
+      - ./data:/data
+    environment:
+      BIND_PORT: ${BIND_PORT:-8080}
+    restart: unless-stopped

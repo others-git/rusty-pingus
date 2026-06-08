@@ -55,8 +55,9 @@ pub const DEFAULT_MONITORS_CONFIG: &str = r#"# rusty-pingus monitors configurati
 # protocol = "border"
 # name = "home-border"
 # interval_ms = 30000
-# gateway = "192.168.1.1"  # optional; auto-detected when omitted
-# upstream = "1.1.1.1"      # upstream reference (default 1.1.1.1)
+# gateway = "192.168.1.1"    # optional; auto-detected via traceroute to 8.8.8.8 when omitted
+# isp_gateway = "74.0.0.1"   # optional; auto-detected (first public hop after last private hop)
+# upstream = "1.1.1.1"       # internet reference (default 1.1.1.1)
 
 # Traceroute monitor example (per-hop path latency; requires ICMP privileges):
 # [[monitors]]
@@ -134,11 +135,12 @@ impl MonitorConfig {
             Self::Tcp(c) => format!("{}:{}", c.host, c.port),
             Self::Icmp(c) => c.host.clone(),
             Self::PublicIp(c) => c.url.clone().unwrap_or_else(|| DEFAULT_PUBLICIP_URL.to_string()),
-            Self::Border(c) => format!(
-                "{} → {}",
-                c.gateway.clone().unwrap_or_else(|| "auto".to_string()),
-                c.upstream
-            ),
+            Self::Border(c) => match (&c.gateway, &c.isp_gateway) {
+                (Some(gw), Some(isp)) => format!("{gw} → {isp} → {}", c.upstream),
+                (Some(gw), None)      => format!("{gw} → {}", c.upstream),
+                (None,     Some(isp)) => format!("auto → {isp} → {}", c.upstream),
+                (None,     None)      => format!("auto → {}", c.upstream),
+            },
             Self::Traceroute(c) => c.host.clone(),
         }
     }
@@ -253,10 +255,14 @@ pub struct PublicIpMonitorConfig {
 #[serde(from = "RawBorderMonitorConfig")]
 pub struct BorderMonitorConfig {
     pub name: String,
-    /// Local gateway to probe. Auto-detected when unset.
+    /// Local (egress) gateway — last private-IP hop before traffic reaches the ISP.
+    /// Auto-detected via traceroute to 8.8.8.8 when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
-    /// Upstream reference, defaulting to [`DEFAULT_BORDER_UPSTREAM`].
+    /// ISP-side gateway — first public-IP hop. Auto-detected when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isp_gateway: Option<String>,
+    /// Upstream internet reference, defaulting to [`DEFAULT_BORDER_UPSTREAM`].
     pub upstream: String,
     pub interval_ms: u64,
     pub timeout_ms: u64,
@@ -441,6 +447,7 @@ impl From<RawPublicIpMonitorConfig> for PublicIpMonitorConfig {
 struct RawBorderMonitorConfig {
     name: String,
     #[serde(default)] gateway: Option<String>,
+    #[serde(default)] isp_gateway: Option<String>,
     #[serde(default)] upstream: Option<String>,
     #[serde(default)] interval_ms: Option<u64>,
     #[serde(default)] interval_secs: Option<u64>,
@@ -456,6 +463,7 @@ impl From<RawBorderMonitorConfig> for BorderMonitorConfig {
         Self {
             name: r.name,
             gateway: r.gateway.filter(|g| !g.trim().is_empty()),
+            isp_gateway: r.isp_gateway.filter(|g| !g.trim().is_empty()),
             upstream: r
                 .upstream
                 .filter(|u| !u.trim().is_empty())

@@ -1,0 +1,72 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>rusty-pingus</Name>
+  <Repository>ghcr.io/others-git/rusty-pingus:latest</Repository>
+  <Registry>https://ghcr.io</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/others-git/rusty-pingus/issues</Support>
+  <Project>https://github.com/others-git/rusty-pingus</Project>
+  <Overview>Self-hosted uptime monitor with per-hop traceroute visualization, public-IP tracking, and border-hop latency graphs. Requires CAP_NET_RAW for ICMP ping and traceroute probes.</Overview>
+  <Category>Network:Management</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL/>
+  <Icon/>
+  <!--
+    CAP_NET_RAW and CAP_NET_ADMIN are required for ICMP ping and traceroute
+    probes. If your runtime does not support file capabilities (rootless Docker,
+    some Podman setups) you can replace these with: - -privileged=true
+  -->
+  <ExtraParams>--cap-add=NET_RAW --cap-add=NET_ADMIN</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+
+  <!-- Port: host port → container port. Must match BIND_PORT below. -->
+  <Config Name="WebUI Port"
+          Target="8080"
+          Default="8080"
+          Mode="tcp"
+          Description="Host port for the web interface. Must match the Bind Port variable below."
+          Type="Port"
+          Display="always"
+          Required="true"
+          Mask="false">8080</Config>
+
+  <!-- Volumes -->
+  <Config Name="Config Directory"
+          Target="/config"
+          Default="/mnt/user/appdata/rusty-pingus/config"
+          Mode="rw"
+          Description="Directory containing config.toml and monitors.toml. Copy config.toml from the repo as a starting point."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/rusty-pingus/config</Config>
+
+  <Config Name="Data Directory"
+          Target="/data"
+          Default="/mnt/user/appdata/rusty-pingus/data"
+          Mode="rw"
+          Description="Directory for the SQLite database (rusty-pingus.db)."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/rusty-pingus/data</Config>
+
+  <!-- Environment variables -->
+  <Config Name="Bind Port"
+          Target="BIND_PORT"
+          Default="8080"
+          Mode=""
+          Description="Port the application listens on inside the container. Change the WebUI Port mapping above to match if you alter this."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">8080</Config>
+</Container>

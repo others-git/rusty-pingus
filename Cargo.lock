@@ -2500,6 +2500,8 @@ dependencies = [
  "axum 0.7.9",
  "chrono",
  "clap",
+ "futures-util",
+ "libc",
  "mime_guess",
  "reqwest",
  "rust-embed",

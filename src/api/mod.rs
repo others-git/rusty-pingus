@@ -13,6 +13,7 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::db;
 use crate::monitors::{MonitorConfig, MonitorStore};
@@ -27,6 +28,8 @@ pub struct AppState {
     /// Global retention in days (from config.toml), used as the fallback when a
     /// monitor has no per-monitor `retention_hours`.
     pub global_retention_days: u64,
+    /// Cancelled on shutdown; SSE streams subscribe so they close promptly.
+    pub cancel: CancellationToken,
 }
 
 // ── Live status updates (SSE) ─────────────────────────────────────────────────
@@ -68,13 +71,17 @@ pub async fn monitor_stream(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.updates.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|res| match res {
+    let cancel = state.cancel.clone();
+    let inner = BroadcastStream::new(rx).filter_map(|res| match res {
         Ok(update) => Some(Ok(Event::default()
             .json_data(&update)
             .unwrap_or_else(|_| Event::default().comment("serialize error")))),
         // Lagged: the client fell behind and missed events; skip, the poll reconciles.
         Err(_) => None,
     });
+    // End the stream (and close the connection) when the app shuts down, so
+    // axum's graceful shutdown doesn't wait on long-lived SSE connections.
+    let stream = futures_util::StreamExt::take_until(inner, cancel.cancelled_owned());
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 

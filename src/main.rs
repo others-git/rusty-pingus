@@ -147,6 +147,7 @@ async fn async_main(
         monitors: monitor_store,
         updates: updates_tx.clone(),
         global_retention_days,
+        cancel: cancel.clone(),
     };
 
     let sched_handle = {
@@ -189,7 +190,7 @@ async fn async_main(
     }
     cancel.cancel();
 
-    let drain = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let drain = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let _ = sched_handle.await;
         let _ = web_handle.await;
         let _ = retention_handle.await;

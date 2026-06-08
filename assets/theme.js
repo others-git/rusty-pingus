@@ -10,71 +10,7 @@
     { id: 'steam',   name: '⚙ Steampunk — BRASS & STEAM' },
     { id: 'solar',   name: '🌻 Solarpunk — SUNFLOWER' },
     { id: 'vapor',   name: '🌴 Vaporwave — A E S T H E T I C' },
-    { id: 'chaos',   name: '🌀 CHAOS — ENTROPY' },
   ];
-
-  // The CHAOS theme references an SVG turbulence/displacement filter (#chaos-warp)
-  // to warp elements. CSS can't define SVG filters, so inject it once (harmless
-  // for other themes; it has no visual effect unless referenced).
-  function injectChaosFilter() {
-    if (document.getElementById('chaos-warp-svg')) return;
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.id = 'chaos-warp-svg';
-    svg.setAttribute('width', '0');
-    svg.setAttribute('height', '0');
-    svg.style.cssText = 'position:absolute;width:0;height:0';
-    svg.innerHTML =
-      '<filter id="chaos-warp">' +
-      '<feTurbulence type="fractalNoise" baseFrequency="0.012 0.016" numOctaves="2" result="n">' +
-      '<animate attributeName="baseFrequency" dur="16s" values="0.010 0.014;0.022 0.009;0.010 0.014" repeatCount="indefinite"/>' +
-      '</feTurbulence>' +
-      '<feDisplacementMap in="SourceGraphic" in2="n" scale="12"/>' +
-      '</filter>';
-    document.body.appendChild(svg);
-  }
-
-  // CHAOS background: a field of randomized geometric shapes. CSS can't generate
-  // randomness, so we seed positions/sizes/shapes/parallax-depth here once; the
-  // *reaction* to the mouse is pure CSS (shapes translate/rotate via --mx/--my).
-  function injectChaosShapes() {
-    if (document.getElementById('chaos-shapes')) return;
-    const clips = [
-      'polygon(50% 0,0 100%,100% 100%)',                                   // triangle
-      'polygon(50% 0,100% 50%,50% 100%,0 50%)',                            // diamond
-      'polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%)',             // hexagon
-      'polygon(0 0,50% 22%,100% 0,100% 100%,50% 78%,0 100%)',              // hourglass-ish
-      'none',                                                              // square
-      'polygon(50% 0,61% 35%,98% 35%,68% 57%,79% 91%,50% 70%,21% 91%,32% 57%,2% 35%,39% 35%)', // star
-    ];
-    const colors = ['#9dff00', '#ff0044', '#00e5ff', '#e8e8ff'];
-    const rnd = (a, b) => a + Math.random() * (b - a);
-    let html = '';
-    for (let i = 0; i < 18; i++) {
-      const size = rnd(36, 200) | 0;
-      const clip = clips[(Math.random() * clips.length) | 0];
-      const c = colors[(Math.random() * colors.length) | 0];
-      const px = (rnd(18, 80) * (Math.random() < 0.5 ? -1 : 1)) | 0;
-      const py = (rnd(18, 80) * (Math.random() < 0.5 ? -1 : 1)) | 0;
-      const style = [
-        `top:${rnd(-5, 100).toFixed(1)}%`, `left:${rnd(-5, 100).toFixed(1)}%`,
-        `width:${size}px`, `height:${size}px`,
-        `--px:${px}px`, `--py:${py}px`,
-        `--spin:${rnd(9, 34).toFixed(1)}s`,
-        `animation-delay:${(-rnd(0, 30)).toFixed(1)}s`,
-        Math.random() < 0.5 ? 'animation-direction:reverse' : '',
-        clip !== 'none' ? `clip-path:${clip}` : '',
-        `background:${c}${Math.random() < 0.3 ? '33' : '14'}`,
-        `box-shadow:0 0 0 1px ${c}66`,
-        `filter:drop-shadow(0 0 7px ${c}aa)`,
-      ].filter(Boolean).join(';');
-      html += `<i class="chaos-shape" style="${style}"></i>`;
-    }
-    const wrap = document.createElement('div');
-    wrap.id = 'chaos-shapes';
-    wrap.setAttribute('aria-hidden', 'true');
-    wrap.innerHTML = html;
-    document.body.appendChild(wrap);
-  }
 
   // Resolve a stored value to a real theme: nothing stored, or the removed legacy
   // "default", both map to the cyberpunk default.
@@ -133,8 +69,6 @@
     root.appendChild(handle);
     root.appendChild(menu);
     document.body.appendChild(root);
-    injectChaosFilter();
-    injectChaosShapes();
     mark();
   }
 
