@@ -4,7 +4,7 @@ Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP
 
 ## Features
 
-- HTTP(S), TCP, ICMP, public-IP, and border probing
+- HTTP(S), TCP, ICMP, public-IP, border, and traceroute probing
 - Per-monitor configurable intervals and timeouts
 - SQLite persistence with automatic migrations
 - Web dashboard at `http://localhost:3000`
@@ -45,7 +45,7 @@ If you have an existing `config.toml` with `[[monitors]]` entries (from v0.0.1),
 
 ### config.toml
 
-Create a `config.toml` (see `config.toml` in this repo for a full example):
+App-wide settings only — monitors live in `monitors.toml` (see below). See `config.toml` in this repo for a commented example:
 
 ```toml
 [defaults]
@@ -59,6 +59,15 @@ bind = "0.0.0.0:3000"
 [database]
 path = "./data/rusty-pingus.db"
 
+[monitors]
+path = "./monitors.toml"
+```
+
+### monitors.toml
+
+Monitor definitions are an array of `[[monitors]]` tables, each tagged by `protocol`. This file is managed by the web UI (additions/removals are written back automatically), or you can edit it directly. Every monitor accepts two optional fields: `enabled = false` pauses it (kept in config and history, but not probed), and `retention_hours` overrides how long its data is kept (default: the global `retention_days × 24`).
+
+```toml
 # HTTP monitor
 [[monitors]]
 protocol = "http"
@@ -95,8 +104,20 @@ interval_ms = 300000
 protocol = "border"
 name = "home-border"
 interval_ms = 30000
-# gateway = "192.168.1.1"  # optional; auto-detected when omitted
-upstream = "1.1.1.1"        # upstream reference (default 1.1.1.1)
+# gateway = "192.168.1.1"      # optional; auto-detected when omitted
+# isp_gateway = "74.0.0.1"     # optional; auto-detected (first public hop)
+upstream = "1.1.1.1"           # internet reference (default 1.1.1.1)
+
+# Traceroute monitor — per-hop path latency (requires ICMP privileges)
+[[monitors]]
+protocol = "traceroute"
+name = "path-to-cloudflare"
+host = "1.1.1.1"
+interval_ms = 5000             # minimum 500 ms enforced for this type
+timeout_ms = 1000              # per-hop reply wait
+max_hops = 30                  # optional (default 30)
+queries_per_hop = 3            # optional (default 3)
+retention_hours = 24           # optional (default 24 h)
 ```
 
 ### Configuration Reference
@@ -108,6 +129,9 @@ upstream = "1.1.1.1"        # upstream reference (default 1.1.1.1)
 | `[defaults].retention_days` | integer | 90 | Delete results older than N days. Defaults to 90 when unset (probe history is pruned automatically so the database doesn't grow without bound — important at low poll intervals). Set a larger value to keep more history. |
 | `[web].bind` | string | `0.0.0.0:3000` | Web server bind address |
 | `[database].path` | string | `./data/rusty-pingus.db` | SQLite file path |
+| `[monitors].path` | string | `./monitors.toml` | Path to the monitor definitions file |
+
+Every monitor type also accepts two optional fields: `enabled` (boolean, default `true`; set `false` to pause without deleting) and `retention_hours` (integer; overrides the global retention for that monitor's data).
 
 **HTTP monitor fields:**
 
@@ -132,7 +156,7 @@ The ICMP probe sends `count` echo requests per cycle (default 3, minimum 1), eac
 
 The public-IP monitor (`protocol = "publicip"`) periodically GETs an IP-echo service and records your host's external IP. `url` is optional: when omitted it queries `https://checkip.amazonaws.com` and falls back to `https://icanhazip.com` if that fails. The monitor is **up** when a service returns a parseable IP address — which is shown as the probe's *detail* on the dashboard — and **down** when no IP can be obtained. When the IP differs from the previously recorded one, the change is surfaced in the detail (e.g. `203.0.113.7 (changed from 198.51.100.4)`) so it's visible in history. Useful for spotting ISP IP rotations that affect DNS, port-forwarding, or allow-lists.
 
-**Border monitor fields:** `name`, `interval_ms`, `timeout_ms`, `gateway` (optional), `upstream` (default `1.1.1.1`)
+**Border monitor fields:** `name`, `interval_ms`, `timeout_ms`, `gateway` (optional), `isp_gateway` (optional), `upstream` (default `1.1.1.1`)
 
 The border monitor (`protocol = "border"`) localizes a connectivity fault — *"is it me or them?"* — by ICMP-pinging your local gateway **and** an upstream reference each cycle, then classifying the result (carried in the probe's *detail*):
 
@@ -142,7 +166,11 @@ The border monitor (`protocol = "border"`) localizes a connectivity fault — *"
 | reachable | unreachable | `down` | `isp_down` — gateway up, internet down |
 | unreachable | (either) | `down` | `lan_down` — local gateway/LAN down |
 
-Overall status follows **upstream** reachability and the recorded response time is the upstream RTT. `gateway` is auto-detected from the system routing table when omitted (best-effort on Linux/macOS/Windows); if it can neither be configured nor detected, the monitor reports `down` with a clear reason rather than guessing — configuring `gateway` explicitly is the reliable path. Like ICMP monitors, the border monitor needs raw-socket privileges (see **ICMP Privileges** below).
+Overall status follows **upstream** reachability and the recorded response time is the upstream RTT. `gateway` (your local egress gateway) and `isp_gateway` (the first public hop) are auto-detected via traceroute when omitted (best-effort on Linux/macOS/Windows); if the gateway can neither be configured nor detected, the monitor reports `down` with a clear reason rather than guessing — configuring `gateway` explicitly is the reliable path. Like ICMP monitors, the border monitor needs raw-socket privileges (see **ICMP Privileges** below).
+
+**Traceroute monitor fields:** `name`, `host`, `interval_ms`, `timeout_ms`, `max_hops` (default 30), `queries_per_hop` (default 3), `retention_hours` (default 24)
+
+The traceroute monitor (`protocol = "traceroute"`) records the full per-hop path to `host` each cycle — sending `queries_per_hop` ICMP echoes per hop (up to `max_hops`) and storing the min/avg/max RTT for every responding hop. The monitor detail page renders this as a per-hop latency view so you can see *where* along the path latency or loss appears, not just the endpoint result. Because a run is expensive and high-volume, the scheduling interval is clamped to a **500 ms minimum** and per-hop data is retained for `retention_hours` (default 24). Like ICMP and border monitors, it needs raw-socket privileges (see **ICMP Privileges** below).
 
 ## Running
 
@@ -171,14 +199,16 @@ The `--monitors` flag overrides the monitors file path from `config.toml`. Monit
 Double-click `rusty-pingus.exe` from Explorer or your Downloads folder. A cyan icon appears in the system tray (notification area, bottom-right). No console window opens.
 
 - **Left-click** the tray icon → opens the dashboard in your default browser
-- **Right-click** → "Open Dashboard" or "Quit"
+- **Right-click** → "Open Dashboard", "Reload Config", or "Quit"
 - On **first launch** (no existing database), the dashboard opens automatically
+
+**Reload Config** re-reads `config.toml` from disk and applies it — primarily to pick up a changed `[web].bind` port — by relaunching the app, so there's no need to manually quit and restart. The web server briefly restarts on the new port; monitoring resumes automatically.
 
 ### Logs
 Release builds write logs to `<data_dir>/logs/rusty-pingus.YYYY-MM-DD.log` (default: `./data/logs/`). For debug output, run from a terminal using a debug build (`cargo run`).
 
 ### First run / missing config
-If no `config.toml` is present, rusty-pingus generates a default one and starts with zero monitors. Edit the generated file and restart to add monitors.
+On first run, rusty-pingus generates default `config.toml` and `monitors.toml` files and starts with zero monitors. Add monitors via the web UI, or edit `monitors.toml` directly.
 
 ## ICMP Privileges
 
@@ -201,6 +231,17 @@ TCP and HTTP probes work without elevated privileges.
 - `GET /api/monitors/:name/history?from=<iso8601>&to=<iso8601>&limit=100` — raw probe history
 - `GET /api/monitors/:name/uptime` — uptime % for 1h, 24h, 7d, 30d windows
 - `GET /api/monitors/:name/series?from=<iso8601>&to=<iso8601>&buckets=300` — response time aggregated into a bounded number of time buckets (each: bucket start, avg/min/max ms, sample count, up-ratio). Used by the monitor detail chart so any window stays fast regardless of poll interval. `buckets` is clamped to 50–1000; defaults are the last 24h with ~300 buckets.
+- `GET /api/monitors/:name/segments?from=<iso8601>&to=<iso8601>` — contiguous up/down segments over the window, for drawing downtime bands.
+- `GET /api/monitors/:name/extent` — the earliest and latest retained timestamps for the monitor (the bounds available to chart/history queries).
+- `GET /api/monitors/:name/traceroute?from=<iso8601>&to=<iso8601>` — per-hop traceroute data (traceroute monitors only).
+- `GET /api/monitors/:name/traceroute/extent` — the retained time range of traceroute data for the monitor.
+
+**Monitor management** (these mutate `monitors.toml`):
+
+- `GET /api/monitors/config` — full monitor definitions (the parsed `monitors.toml`).
+- `POST /api/monitors` — add a monitor.
+- `POST /api/monitors/:name/enabled` — enable/disable a monitor (pauses probing without deleting it).
+- `DELETE /api/monitors/:name` — remove a monitor.
 
 Wide chart windows and long uptime windows (7d/30d) are served from **per-minute rollups** (a background task aggregates `probe_results` into a `probe_rollup_1m` table), so their cost scales with minutes rather than the raw row count — important at low poll intervals. Fine/recent ranges still read raw results, and queries fall back to raw until the rollup has backfilled.
 
