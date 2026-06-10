@@ -314,3 +314,120 @@ fn existing_config_not_overwritten() {
     let cfg = config::load(&config_path).expect("load");
     assert_eq!(cfg.web.bind, "127.0.0.1:9999", "existing config should be respected");
 }
+
+// ── Tray "Reload Config" behavior ───────────────────────────────────────────
+//
+// The Windows tray "Reload Config" action re-launches the executable with the
+// same arguments so it re-reads config.toml from disk — primarily to pick up a
+// changed `[web].bind` port. The re-exec itself is Windows-only and ends in
+// `process::exit`, so it can't be called directly here. Instead we verify the
+// observable end-to-end behavior the action relies on: running the real binary,
+// then running it again after editing the bind port, makes it serve on the new
+// port (exactly what the tray does — spawn current_exe with the same args).
+
+use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
+use std::process::Command;
+
+/// Reserve a free loopback port by binding an ephemeral listener and dropping
+/// it, returning the port number that was just freed.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Poll until a TCP connect to `addr` reaches the desired state (`up == true`
+/// means "accepts connections"). Returns true if the state was observed within
+/// the timeout, false otherwise.
+fn wait_for_port(addr: SocketAddr, up: bool, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let connected = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok();
+        if connected == up {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Write a self-contained config.toml (server + temp db/monitors) bound to
+/// `port` on loopback.
+fn write_config(config_path: &std::path::Path, dir: &std::path::Path, port: u16) {
+    let db_path = dir.join("data").join("test.db");
+    let monitors_path = dir.join("monitors.toml");
+    let mut f = std::fs::File::create(config_path).unwrap();
+    write!(
+        f,
+        "[web]\nbind = \"127.0.0.1:{port}\"\n\n\
+         [database]\npath = {db:?}\n\n\
+         [monitors]\npath = {mon:?}\n",
+        port = port,
+        db = db_path.to_string_lossy(),
+        mon = monitors_path.to_string_lossy(),
+    )
+    .unwrap();
+}
+
+/// Spawn the built binary against `config_path` and wait for it to serve `addr`.
+fn spawn_serving(config_path: &std::path::Path, addr: SocketAddr) -> std::process::Child {
+    let child = Command::new(env!("CARGO_BIN_EXE_rusty-pingus"))
+        .arg("--config")
+        .arg(config_path)
+        // Avoid spawning a real browser on first launch (non-Windows path).
+        .env("BROWSER", "true")
+        .spawn()
+        .expect("spawn rusty-pingus binary");
+    assert!(
+        wait_for_port(addr, true, Duration::from_secs(15)),
+        "server did not start serving on {addr}"
+    );
+    child
+}
+
+/// Running the binary, then running it again after the bind port is edited in
+/// config.toml, serves on the new port — the core of the tray "Reload Config".
+#[test]
+fn reload_picks_up_changed_bind_port() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.toml");
+
+    let port_a = free_port();
+    let port_b = free_port();
+    assert_ne!(port_a, port_b, "need two distinct free ports");
+    let addr_a: SocketAddr = format!("127.0.0.1:{port_a}").parse().unwrap();
+    let addr_b: SocketAddr = format!("127.0.0.1:{port_b}").parse().unwrap();
+
+    // ── Initial launch on port A ──
+    write_config(&config_path, dir.path(), port_a);
+    let mut child = spawn_serving(&config_path, addr_a);
+
+    // Stop it the way "Reload Config" does (graceful cancel frees the port
+    // before the new process binds) — kill + wait is the test-side equivalent.
+    child.kill().expect("kill first instance");
+    child.wait().expect("wait first instance");
+    assert!(
+        wait_for_port(addr_a, false, Duration::from_secs(10)),
+        "port A should be released after the first instance exits"
+    );
+
+    // ── Edit config to a new port, then re-launch (what the tray action does) ──
+    write_config(&config_path, dir.path(), port_b);
+    let mut child2 = spawn_serving(&config_path, addr_b);
+
+    // The new port is live and the old one is not.
+    assert!(
+        wait_for_port(addr_b, true, Duration::from_secs(5)),
+        "server should be serving on the new port B after reload"
+    );
+    assert!(
+        wait_for_port(addr_a, false, Duration::from_millis(500)),
+        "old port A should no longer be served after reload"
+    );
+
+    child2.kill().expect("kill second instance");
+    child2.wait().expect("wait second instance");
+}

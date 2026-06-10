@@ -33,17 +33,52 @@ fn make_icon() -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, size, size).expect("build tray icon")
 }
 
+/// Re-launch this executable with the same command-line arguments, then signal
+/// shutdown so the current process releases its resources — notably the web
+/// server's bound port. Used by the tray "Reload Config" action to pick up
+/// changes to config.toml (including a new `[web].bind` port) without the user
+/// having to manually stop and restart the app.
+///
+/// Order matters: we cancel first so the running web server gracefully shuts
+/// down and frees its port *before* the new process tries to bind it.
+fn reload_config(cancel: &CancellationToken) -> ! {
+    use std::process::Command;
+
+    let exe = std::env::current_exe();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    cancel.cancel();
+    // Give the async runtime a moment to drain and release the bound port.
+    std::thread::sleep(Duration::from_millis(1000));
+
+    match exe {
+        Ok(exe) => {
+            if let Err(e) = Command::new(&exe).args(&args).spawn() {
+                tracing::error!(error = %e, "Failed to relaunch for config reload");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Could not determine current executable for config reload");
+        }
+    }
+
+    std::process::exit(0);
+}
+
 /// Create the system tray icon and run a Win32 message loop on the calling
 /// (main) thread. This function never returns.
 pub fn run_event_loop(dashboard_url: String, cancel: CancellationToken) -> ! {
     let open_item = MenuItem::new("Open Dashboard", true, None);
+    let reload_item = MenuItem::new("Reload Config", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
     let menu = Menu::new();
     menu.append(&open_item).expect("menu append");
+    menu.append(&reload_item).expect("menu append");
     menu.append(&quit_item).expect("menu append");
 
     let open_id = open_item.id().clone();
+    let reload_id = reload_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     // TrayIcon must be created on the thread that runs the message loop.
@@ -83,6 +118,8 @@ pub fn run_event_loop(dashboard_url: String, cancel: CancellationToken) -> ! {
         if let Ok(menu_event) = MenuEvent::receiver().try_recv() {
             if menu_event.id == open_id {
                 let _ = webbrowser::open(&dashboard_url);
+            } else if menu_event.id == reload_id {
+                reload_config(&cancel);
             } else if menu_event.id == quit_id {
                 cancel.cancel();
                 // Brief pause to let the async runtime start shutting down.
