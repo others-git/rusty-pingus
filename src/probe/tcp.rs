@@ -5,22 +5,6 @@ use tracing::debug;
 use crate::monitors::TcpMonitorConfig;
 use super::ProbeResult;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cfg(host: &str, port: u16, timeout_ms: u64) -> TcpMonitorConfig {
-        TcpMonitorConfig { name: "test".into(), host: host.into(), port, interval_ms: 60_000, timeout_ms, retention_hours: None, enabled: true }
-    }
-
-    #[tokio::test]
-    async fn tcp_loopback_refused() {
-        // Port 1 on loopback should be refused instantly
-        let result = run(&cfg("127.0.0.1", 1, 3000)).await;
-        assert_eq!(result.status, "down");
-    }
-}
-
 pub async fn run(cfg: &TcpMonitorConfig) -> ProbeResult {
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let timeout = Duration::from_millis(cfg.timeout_ms);
@@ -46,5 +30,21 @@ pub async fn run(cfg: &TcpMonitorConfig) -> ProbeResult {
             ProbeResult::down(&cfg.name, "tcp", &addr, &reason)
         }
         Err(_) => ProbeResult::down(&cfg.name, "tcp", &addr, "timeout"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(host: &str, port: u16, timeout_ms: u64) -> TcpMonitorConfig {
+        TcpMonitorConfig { name: "test".into(), host: host.into(), port, interval_ms: 60_000, timeout_ms, retention_hours: None, enabled: true }
+    }
+
+    #[tokio::test]
+    async fn tcp_loopback_refused() {
+        // Port 1 on loopback should be refused instantly
+        let result = run(&cfg("127.0.0.1", 1, 3000)).await;
+        assert_eq!(result.status, "down");
     }
 }

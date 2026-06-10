@@ -94,7 +94,7 @@ pub async fn run(cfg: &BorderMonitorConfig) -> ProbeResult {
     let privilege_err = matches!(gw_result, Err(PingError::Privilege))
         || isp_result
             .as_ref()
-            .map_or(false, |r| matches!(r, Err(PingError::Privilege)))
+            .is_some_and(|r| matches!(r, Err(PingError::Privilege)))
         || matches!(up_result, Err(PingError::Privilege));
     if privilege_err {
         warn!(monitor = %cfg.name, "Border probe socket error — check CAP_NET_RAW privileges");
@@ -174,6 +174,7 @@ async fn resolve_gateways(cfg: &BorderMonitorConfig) -> (Option<String>, Option<
 }
 
 /// Pure classification of a border cycle — network-free, for testing.
+#[allow(clippy::too_many_arguments)]
 fn classify_border(
     name: &str,
     endpoint: &str,
