@@ -21,4 +21,10 @@ services:
       - ./data:/data
     environment:
       BIND_PORT: ${BIND_PORT:-8080}
+      # User/group the app runs as. The entrypoint chowns the mounts to these
+      # IDs and drops privileges to them. Defaults match Unraid's nobody:users;
+      # set to your host user (e.g. PUID=1000) elsewhere.
+      PUID: ${PUID:-99}
+      PGID: ${PGID:-100}
+      UMASK: ${UMASK:-022}
     restart: unless-stopped
