@@ -1,6 +1,14 @@
-# rusty-pingus
+<p align="center">
+  <img src="assets/icon.png" alt="rusty-pingus" width="140" />
+</p>
 
-Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP, TCP, ICMP, public-IP, border, and traceroute checks from your own network location. Stores monitors and results in SQLite and serves a web dashboard.
+<h1 align="center">rusty-pingus</h1>
+
+<p align="center">
+  Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP, TCP, ICMP,
+  public-IP, border, and traceroute checks from your own network location.
+  Stores monitors and results in SQLite and serves a web dashboard.
+</p>
 
 ## Features
 
