@@ -1,6 +1,6 @@
 # rusty-pingus
 
-Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP, TCP, ICMP, public-IP, and border checks from your own network location. Stores results in SQLite and serves a web dashboard.
+Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP, TCP, ICMP, public-IP, border, and traceroute checks from your own network location. Stores monitors and results in SQLite and serves a web dashboard.
 
 ## Features
 
@@ -12,8 +12,9 @@ Self-hosted uptime monitor written in Rust. Monitors external endpoints via HTTP
 - JSON API for programmatic access
 - Single self-contained binary
 - **Windows**: system tray icon, double-click to open dashboard, no console window
-- Add and remove monitors via the web UI — no config file editing required
-- Auto-generates default config files on first run
+- Add, edit, pause, and remove monitors from the web UI (or JSON API) — no config file editing required
+- Monitors stored in the database with stable ids, so they can be renamed without losing history
+- Auto-generates a default `config.toml` on first run
 
 ## Installation
 
