@@ -1,6 +1,6 @@
 [package]
 name = "rusty-pingus"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [dependencies]
@@ -14,7 +14,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 surge-ping = "0.8"
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }

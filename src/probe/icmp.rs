@@ -1,6 +1,8 @@
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
-use surge_ping::{Client, Config, PingIdentifier, PingSequence, ICMP};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::OnceLock;
+use std::time::Duration;
+use surge_ping::{Client, Config, PingIdentifier, PingSequence, SurgeError, ICMP};
 use tracing::{debug, warn};
 
 use crate::monitors::IcmpMonitorConfig;
@@ -26,45 +28,56 @@ pub enum PingError {
     Other(String),
 }
 
+/// One shared surge-ping client per address family, created on first use for
+/// the process lifetime. Each `Client` owns a raw socket plus a background
+/// receive task, so building one per echo (the old behavior) churned sockets
+/// constantly. A creation failure (missing privilege — stable for the process
+/// lifetime) is cached as `None`.
+fn ping_client(ip: IpAddr) -> Option<&'static Client> {
+    static V4: OnceLock<Option<Client>> = OnceLock::new();
+    static V6: OnceLock<Option<Client>> = OnceLock::new();
+    match ip {
+        IpAddr::V4(_) => V4.get_or_init(|| Client::new(&Config::default()).ok()),
+        IpAddr::V6(_) => V6.get_or_init(|| Client::new(&Config::builder().kind(ICMP::V6).build()).ok()),
+    }
+    .as_ref()
+}
+
+/// Unique echo identifier per ping, so concurrent pings multiplexed over the
+/// shared clients can't collide on (identifier, sequence).
+fn next_ident() -> u16 {
+    static IDENT: AtomicU16 = AtomicU16::new(1);
+    IDENT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Resolve `host` to an IP address: direct parse first, then DNS.
+pub async fn resolve_host(host: &str) -> Result<IpAddr, PingError> {
+    if let Ok(ip) = host.parse() {
+        return Ok(ip);
+    }
+    match tokio::net::lookup_host(format!("{host}:0")).await {
+        Ok(mut addrs) => addrs.next().map(|a| a.ip()).ok_or(PingError::Dns),
+        Err(_) => Err(PingError::Dns),
+    }
+}
+
 /// Send a single ICMP echo request to `host`, returning the round-trip time in
-/// milliseconds. Resolves the host, builds a one-shot client, and awaits one
-/// reply bounded by `timeout`. Shared by the ICMP and border probes.
+/// milliseconds. Shared by the ICMP and border probes.
 pub async fn ping_once(host: &str, timeout: Duration) -> Result<u64, PingError> {
-    let ip: IpAddr = match host.parse() {
-        Ok(ip) => ip,
-        Err(_) => match tokio::net::lookup_host(format!("{host}:0")).await {
-            Ok(mut addrs) => match addrs.next() {
-                Some(addr) => addr.ip(),
-                None => return Err(PingError::Dns),
-            },
-            Err(_) => return Err(PingError::Dns),
-        },
-    };
+    ping_ip(resolve_host(host).await?, timeout).await
+}
 
-    let icmp_type = match ip {
-        IpAddr::V4(_) => ICMP::V4,
-        IpAddr::V6(_) => ICMP::V6,
-    };
-
-    let client = match Client::new(&Config::builder().kind(icmp_type).build()) {
-        Ok(c) => c,
-        Err(_) => return Err(PingError::Privilege),
-    };
-
-    let mut pinger = client.pinger(ip, PingIdentifier(rand_id())).await;
+/// Send a single ICMP echo to an already-resolved address and await one reply
+/// bounded by `timeout`. Never returns `PingError::Dns`.
+pub async fn ping_ip(ip: IpAddr, timeout: Duration) -> Result<u64, PingError> {
+    let client = ping_client(ip).ok_or(PingError::Privilege)?;
+    let mut pinger = client.pinger(ip, PingIdentifier(next_ident())).await;
     pinger.timeout(timeout);
 
-    let start = Instant::now();
     match pinger.ping(PingSequence(0), &[]).await {
-        Ok(_) => Ok(start.elapsed().as_millis() as u64),
-        Err(e) => {
-            let s = e.to_string();
-            if s.contains("timed out") || s.contains("timeout") {
-                Err(PingError::NoReply)
-            } else {
-                Err(PingError::Other(format!("error: {e}")))
-            }
-        }
+        Ok((_, rtt)) => Ok(rtt.as_millis() as u64),
+        Err(SurgeError::Timeout { .. }) => Err(PingError::NoReply),
+        Err(e) => Err(PingError::Other(format!("error: {e}"))),
     }
 }
 
@@ -72,23 +85,27 @@ pub async fn run(cfg: &IcmpMonitorConfig) -> ProbeResult {
     let endpoint = cfg.host.clone();
     let timeout = Duration::from_millis(cfg.timeout_ms);
 
-    // Send `count` echoes sequentially via the shared `ping_once` helper. Tally
-    // replies, track the best (lowest) RTT, and remember the last non-timeout
-    // error. DNS / privilege failures are stable, so short-circuit on the first.
+    // Resolve once per cycle (not per echo); a DNS failure is stable for the cycle.
+    let ip = match resolve_host(&cfg.host).await {
+        Ok(ip) => ip,
+        Err(_) => return ProbeResult::down(&cfg.name, "icmp", &endpoint, "dns_error"),
+    };
+
+    // Send `count` echoes sequentially. Tally replies, track the best (lowest)
+    // RTT, and remember the last non-timeout error. A privilege failure is
+    // stable, so short-circuit on the first.
     let mut received: u32 = 0;
     let mut min_rtt: Option<u64> = None;
     let mut non_timeout_errors: u32 = 0;
     let mut last_non_timeout_error: Option<String> = None;
 
     for _ in 0..cfg.count {
-        match ping_once(&cfg.host, timeout).await {
+        match ping_ip(ip, timeout).await {
             Ok(rtt) => {
                 received += 1;
                 min_rtt = Some(min_rtt.map_or(rtt, |m| m.min(rtt)));
             }
-            Err(PingError::Dns) => {
-                return ProbeResult::down(&cfg.name, "icmp", &endpoint, "dns_error");
-            }
+            Err(PingError::Dns) => unreachable!("ping_ip never returns Dns"),
             Err(PingError::Privilege) => {
                 warn!(monitor = %cfg.name, "ICMP socket error — check CAP_NET_RAW privileges");
                 return ProbeResult::down(&cfg.name, "icmp", &endpoint, "privilege_error");
@@ -153,14 +170,6 @@ fn decide_icmp_result(
             .unwrap_or_else(|| format!("no_reply ({received}/{count} replies)"));
         ProbeResult::down(name, "icmp", endpoint, &reason)
     }
-}
-
-fn rand_id() -> u16 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0) & 0xFFFF) as u16
 }
 
 #[cfg(test)]

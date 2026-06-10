@@ -1,23 +1,22 @@
 use std::time::{Duration, Instant};
-use reqwest::{Client, Method};
+use reqwest::Method;
 use tracing::debug;
 
 use crate::monitors::HttpMonitorConfig;
 use super::ProbeResult;
 
 pub async fn run(cfg: &HttpMonitorConfig) -> ProbeResult {
-    let client = match Client::builder()
-        .timeout(Duration::from_millis(cfg.timeout_ms))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return ProbeResult::down(&cfg.name, "http", &cfg.url, &format!("client_build_error: {e}")),
+    let client = match super::shared_http_client() {
+        Some(c) => c,
+        None => return ProbeResult::down(&cfg.name, "http", &cfg.url, "client_build_error"),
     };
 
     let method = Method::from_bytes(cfg.method.as_bytes())
         .unwrap_or(Method::GET);
 
-    let mut req = client.request(method, &cfg.url);
+    let mut req = client
+        .request(method, &cfg.url)
+        .timeout(Duration::from_millis(cfg.timeout_ms));
     for (k, v) in &cfg.headers {
         req = req.header(k, v);
     }

@@ -124,19 +124,20 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
     // history for unconfigured monitors and scales with the monitor count, not the
     // total row count. Configured-but-unprobed monitors show as pending.
     let configured = state.monitors.list().await;
-    // Batched: one query for every monitor's latest status, one for 24h uptime —
-    // instead of two queries per monitor. protocol/endpoint come from the config
-    // (no longer stored per probe row). Both are keyed by the stable monitor id.
-    let latest: std::collections::HashMap<i64, db::CurrentStatus> = db::get_current_status(&state.pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| (s.monitor_id, s))
-        .collect();
+    // One O(1) index seek per monitor for its latest row (cost scales with the
+    // monitor count, not stored history) plus one rollup-backed query for 24h
+    // uptime. protocol/endpoint come from the config (not stored per probe row).
+    let mut latest: std::collections::HashMap<i64, db::CurrentStatus> =
+        std::collections::HashMap::with_capacity(configured.len());
+    for m in configured.iter() {
+        if let Ok(Some(s)) = db::get_latest_status(&state.pool, m.id).await {
+            latest.insert(m.id, s);
+        }
+    }
     let uptime = db::get_uptime_24h_all(&state.pool).await.unwrap_or_default();
 
     let mut result = Vec::with_capacity(configured.len());
-    for m in &configured {
+    for m in configured.iter() {
         let id = m.id;
         let name = m.config.name().to_string();
         let protocol = m.config.protocol().to_string();
@@ -296,6 +297,12 @@ pub async fn monitor_series(
     Path(id): Path<i64>,
     Query(params): Query<SeriesParams>,
 ) -> impl IntoResponse {
+    if state.monitors.get(id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
+        ).into_response();
+    }
     let to = params.to.unwrap_or_else(Utc::now);
     let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
     let buckets = params.buckets.unwrap_or(300).clamp(50, 1000);
@@ -323,6 +330,12 @@ pub async fn monitor_traceroute(
     Path(id): Path<i64>,
     Query(params): Query<TraceParams>,
 ) -> impl IntoResponse {
+    if state.monitors.get(id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
+        ).into_response();
+    }
     let to = params.to.unwrap_or_else(Utc::now);
     let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(1));
     match db::get_traceroute_hops(&state.pool, id, from, to).await {
@@ -340,6 +353,12 @@ pub async fn monitor_traceroute_extent(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
+    if state.monitors.get(id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
+        ).into_response();
+    }
     match db::get_traceroute_extent(&state.pool, id).await {
         Ok(Some((from, to))) => Json(serde_json::json!({ "from": from, "to": to })).into_response(),
         Ok(None) => Json(serde_json::json!({ "from": null, "to": null })).into_response(),
@@ -366,6 +385,12 @@ pub async fn monitor_segments(
     Path(id): Path<i64>,
     Query(params): Query<SegmentsParams>,
 ) -> impl IntoResponse {
+    if state.monitors.get(id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
+        ).into_response();
+    }
     let to = params.to.unwrap_or_else(Utc::now);
     let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
     match db::get_state_segments(&state.pool, id, from.timestamp_millis(), to.timestamp_millis()).await {
@@ -384,9 +409,13 @@ pub async fn monitor_extent(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let retention_hours = state.monitors.get(id).await
-        .map(|m| m.config.retention_hours(state.global_retention_days))
-        .unwrap_or(state.global_retention_days.saturating_mul(24));
+    let Some(m) = state.monitors.get(id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
+        ).into_response();
+    };
+    let retention_hours = m.config.retention_hours(state.global_retention_days);
 
     let ms_to_iso = |ms: i64| {
         DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
@@ -455,7 +484,7 @@ pub async fn update_monitor(
         ).into_response();
     }
 
-    let others: Vec<StoredMonitor> = all.into_iter().filter(|m| m.id != id).collect();
+    let others: Vec<StoredMonitor> = all.iter().filter(|m| m.id != id).cloned().collect();
     let errors = validate_monitor(&monitor, &others);
     if !errors.is_empty() {
         return (

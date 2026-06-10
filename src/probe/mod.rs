@@ -7,6 +7,25 @@ pub mod traceroute;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::sync::OnceLock;
+
+/// Shared HTTP client for the http/publicip probes. Building a `reqwest::Client`
+/// constructs a fresh TLS config and connection pool — far too expensive to do
+/// per probe. Connection reuse is disabled (`pool_max_idle_per_host(0)`) so each
+/// probe still measures a full DNS + TCP + TLS round, exactly as before; the
+/// timeout is per-request since each monitor configures its own. A build failure
+/// (TLS init) is cached as `None` — every probe would have failed the same way.
+pub(crate) fn shared_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .ok()
+        })
+        .as_ref()
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeResult {

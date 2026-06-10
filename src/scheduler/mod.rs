@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, watch};
@@ -11,10 +12,10 @@ use crate::db;
 use crate::probe;
 
 pub async fn run(
-    initial_monitors: Vec<StoredMonitor>,
+    initial_monitors: Arc<Vec<StoredMonitor>>,
     pool: SqlitePool,
     cancel: CancellationToken,
-    mut monitor_rx: watch::Receiver<Vec<StoredMonitor>>,
+    mut monitor_rx: watch::Receiver<Arc<Vec<StoredMonitor>>>,
     updates: broadcast::Sender<StatusUpdate>,
 ) {
     // Track running tasks by stable id. The stored string is the serialized
@@ -23,7 +24,7 @@ pub async fn run(
     let mut task_tokens: HashMap<i64, (CancellationToken, String)> = HashMap::new();
 
     // Spawn initial tasks (disabled monitors are not probed).
-    for monitor in &initial_monitors {
+    for monitor in initial_monitors.iter() {
         if !monitor.config.enabled() {
             info!(monitor = %monitor.config.name(), "Monitor disabled; not scheduling");
             continue;
@@ -115,6 +116,18 @@ fn spawn_monitor(
         let config = monitor.config;
         let name = config.name().to_string();
         let interval_ms = config.interval_ms();
+
+        // Stagger the first tick: tickers otherwise start together, so monitors
+        // sharing an interval probe (and write) in lockstep forever. The offset
+        // is deterministic per id and capped at 5 s so the first probe still
+        // lands promptly after startup.
+        let jitter_ms = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % interval_ms.clamp(1, 5_000);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(jitter_ms)) => {}
+            _ = task_cancel_clone.cancelled() => return,
+            _ = global_cancel.cancelled() => return,
+        }
+
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -189,7 +202,7 @@ pub async fn per_monitor_retention_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                for monitor in monitors.list().await {
+                for monitor in monitors.list().await.iter() {
                     let id = monitor.id;
                     let name = monitor.config.name().to_string();
                     let retention_hours = monitor.config.retention_hours(global_retention_days);
@@ -257,7 +270,11 @@ pub async fn rollup_loop(pool: SqlitePool, cancel: CancellationToken) {
                         Err(e) => { error!(error = %e, "Rollup aggregation failed"); break; }
                     }
                 }
-                next_from = now_min;
+                // Resume from where rolling actually stopped: on a failed chunk
+                // this retries the same range next tick instead of skipping it
+                // (a skipped range would never be re-rolled — the watermark
+                // moves past it).
+                next_from = from;
             }
             _ = cancel.cancelled() => break,
         }

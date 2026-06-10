@@ -43,10 +43,12 @@ async fn tcp_probe_up_stored_in_db() {
 
     db::insert_result(&pool, 1, &result).await.expect("insert_result");
 
-    let statuses = db::get_current_status(&pool).await.expect("get_current_status");
-    assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].monitor_id, 1);
-    assert_eq!(statuses[0].status, "up");
+    let status = db::get_latest_status(&pool, 1)
+        .await
+        .expect("get_latest_status")
+        .expect("a row");
+    assert_eq!(status.monitor_id, 1);
+    assert_eq!(status.status, "up");
 }
 
 #[tokio::test]
@@ -79,9 +81,11 @@ async fn tcp_probe_down_stored_in_db() {
 
     db::insert_result(&pool, 1, &result).await.expect("insert_result");
 
-    let statuses = db::get_current_status(&pool).await.expect("get_current_status");
-    assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].status, "down");
+    let status = db::get_latest_status(&pool, 1)
+        .await
+        .expect("get_latest_status")
+        .expect("a row");
+    assert_eq!(status.status, "down");
 }
 
 #[tokio::test]

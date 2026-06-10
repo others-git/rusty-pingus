@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use futures_util::TryStreamExt;
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
@@ -180,18 +181,6 @@ pub async fn get_latest_status(pool: &SqlitePool, monitor_id: i64) -> Result<Opt
     row.as_ref().map(row_to_current).transpose()
 }
 
-pub async fn get_current_status(pool: &SqlitePool) -> Result<Vec<CurrentStatus>> {
-    let rows = sqlx::query(
-        "SELECT monitor_id, status, response_time_ms, failure_reason, detail, checked_at
-         FROM probe_results
-         WHERE id IN (SELECT MAX(id) FROM probe_results WHERE monitor_id IS NOT NULL GROUP BY monitor_id)
-         ORDER BY monitor_id",
-    )
-    .fetch_all(pool)
-    .await?;
-    rows.iter().map(row_to_current).collect()
-}
-
 #[derive(Debug, Serialize)]
 pub struct HistoryRow {
     pub id: i64,
@@ -249,9 +238,9 @@ pub async fn get_uptime(
     monitor_id: i64,
     window_secs: i64,
 ) -> Result<Option<f64>> {
-    // Long windows are served from the per-minute rollup (bounded cost); short
-    // windows use raw rows (fast, and include the current minute).
-    if window_secs > 86_400 {
+    // Windows of a day or more are served from the per-minute rollup (bounded
+    // cost); shorter windows use raw rows (fast, and include the current minute).
+    if window_secs >= 86_400 {
         let from_epoch = (Utc::now() - chrono::Duration::seconds(window_secs)).timestamp();
         let row = sqlx::query(
             "SELECT SUM(count) AS total, SUM(up_count) AS up
@@ -294,6 +283,38 @@ pub async fn get_uptime(
 /// doesn't fan out a per-monitor uptime query). Keyed by monitor id; monitors
 /// with no probes in the window are absent.
 pub async fn get_uptime_24h_all(pool: &SqlitePool) -> Result<std::collections::HashMap<i64, f64>> {
+    fn rows_to_map(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<std::collections::HashMap<i64, f64>> {
+        let mut map = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let total: i64 = row.try_get("total").unwrap_or(0);
+            if total > 0 {
+                let up: i64 = row.try_get("up_count").unwrap_or(0);
+                let id: i64 = row.try_get("monitor_id")?;
+                map.insert(id, (up as f64 / total as f64) * 100.0);
+            }
+        }
+        Ok(map)
+    }
+
+    // Served from the per-minute rollup — cost is bounded by minutes (≤ 1440 per
+    // monitor), not raw probe rows. The rollup trails real time by ≤ ~30 s plus
+    // the current minute, which is negligible in a 24-hour percentage.
+    let from_epoch = (Utc::now() - chrono::Duration::hours(24)).timestamp();
+    let rows = sqlx::query(
+        "SELECT monitor_id,
+                SUM(count) AS total,
+                SUM(up_count) AS up_count
+         FROM probe_rollup_1m WHERE bucket_epoch >= ? GROUP BY monitor_id",
+    )
+    .bind(from_epoch)
+    .fetch_all(pool)
+    .await?;
+    let map = rows_to_map(rows)?;
+    if !map.is_empty() {
+        return Ok(map);
+    }
+
+    // Rollup empty (first startup before the backfill tick) — fall back to raw.
     let from_ms = (Utc::now() - chrono::Duration::hours(24)).timestamp_millis();
     let rows = sqlx::query(
         "SELECT monitor_id,
@@ -304,16 +325,7 @@ pub async fn get_uptime_24h_all(pool: &SqlitePool) -> Result<std::collections::H
     .bind(from_ms)
     .fetch_all(pool)
     .await?;
-    let mut map = std::collections::HashMap::with_capacity(rows.len());
-    for row in rows {
-        let total: i64 = row.try_get("total").unwrap_or(0);
-        if total > 0 {
-            let up: i64 = row.try_get("up_count").unwrap_or(0);
-            let id: i64 = row.try_get("monitor_id")?;
-            map.insert(id, (up as f64 / total as f64) * 100.0);
-        }
-    }
-    Ok(map)
+    rows_to_map(rows)
 }
 
 #[derive(Debug, Serialize)]
@@ -499,24 +511,6 @@ pub async fn roll_up_range(pool: &SqlitePool, from_epoch: i64, to_epoch: i64) ->
     Ok(result.rows_affected())
 }
 
-pub async fn prune_old_rollups(pool: &SqlitePool, retention_days: u64) -> Result<u64> {
-    let cutoff = (Utc::now() - chrono::Duration::days(retention_days as i64)).timestamp();
-    let result = sqlx::query("DELETE FROM probe_rollup_1m WHERE bucket_epoch < ?")
-        .bind(cutoff)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
-
-pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result<u64> {
-    let cutoff_ms = (Utc::now() - chrono::Duration::days(retention_days as i64)).timestamp_millis();
-    let result = sqlx::query("DELETE FROM probe_results WHERE checked_at < ?")
-        .bind(cutoff_ms)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
-}
-
 /// Delete probe_results for one monitor older than `cutoff_ms` (epoch ms).
 pub async fn prune_monitor_results(pool: &SqlitePool, monitor_id: i64, cutoff_ms: i64) -> Result<u64> {
     let result = sqlx::query("DELETE FROM probe_results WHERE monitor_id = ? AND checked_at < ?")
@@ -574,7 +568,10 @@ pub async fn get_state_segments(
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Vec<StateSegment>> {
-    let rows = sqlx::query(
+    // Streamed (not fetch_all): the output is bounded by state changes, but the
+    // input is every probe in range — a fast monitor over a wide brush can be
+    // hundreds of thousands of rows. Fold them as they arrive.
+    let mut rows = sqlx::query(
         "SELECT detail, checked_at FROM probe_results
          WHERE monitor_id = ? AND checked_at >= ? AND checked_at <= ?
          ORDER BY checked_at ASC",
@@ -582,11 +579,10 @@ pub async fn get_state_segments(
     .bind(monitor_id)
     .bind(from_ms)
     .bind(to_ms)
-    .fetch_all(pool)
-    .await?;
+    .fetch(pool);
 
     let mut segs: Vec<StateSegment> = Vec::new();
-    for row in &rows {
+    while let Some(row) = rows.try_next().await? {
         let detail: Option<String> = row.try_get("detail")?;
         let t: i64 = row.try_get("checked_at")?;
         // Leading token of detail: the IP address for publicip, fault class for border.

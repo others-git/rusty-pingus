@@ -1,6 +1,5 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
-use reqwest::Client;
 use sqlx::SqlitePool;
 use tracing::debug;
 
@@ -17,15 +16,11 @@ pub async fn run(cfg: &PublicIpMonitorConfig, pool: &SqlitePool, monitor_id: i64
         .clone()
         .unwrap_or_else(|| DEFAULT_PUBLICIP_URL.to_string());
 
-    let client = match Client::builder()
-        .timeout(Duration::from_millis(cfg.timeout_ms))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return ProbeResult::down(&cfg.name, "publicip", &endpoint, &format!("client_build_error: {e}"))
-        }
+    let client = match super::shared_http_client() {
+        Some(c) => c,
+        None => return ProbeResult::down(&cfg.name, "publicip", &endpoint, "client_build_error"),
     };
+    let timeout = Duration::from_millis(cfg.timeout_ms);
 
     // A configured URL is used as-is; otherwise try the default then the fallback.
     let candidates: Vec<String> = match &cfg.url {
@@ -36,7 +31,7 @@ pub async fn run(cfg: &PublicIpMonitorConfig, pool: &SqlitePool, monitor_id: i64
     let mut last_reason = "no_ip_service".to_string();
     for url in &candidates {
         let start = Instant::now();
-        match client.get(url).send().await {
+        match client.get(url).timeout(timeout).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {

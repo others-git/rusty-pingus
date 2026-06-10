@@ -538,9 +538,12 @@ pub struct StoredMonitor {
 
 #[derive(Clone)]
 pub struct MonitorStore {
-    inner: Arc<RwLock<Vec<StoredMonitor>>>,
+    // The monitor list is an immutable Arc snapshot, swapped wholesale on every
+    // mutation: `list()` (called on every dashboard poll and retention pass) is
+    // then a pointer clone, not a Vec clone.
+    inner: Arc<RwLock<Arc<Vec<StoredMonitor>>>>,
     pool: SqlitePool,
-    tx: watch::Sender<Vec<StoredMonitor>>,
+    tx: watch::Sender<Arc<Vec<StoredMonitor>>>,
 }
 
 impl MonitorStore {
@@ -552,7 +555,7 @@ impl MonitorStore {
         pool: SqlitePool,
         legacy_path: &Path,
         defaults: &Defaults,
-    ) -> Result<(Self, watch::Receiver<Vec<StoredMonitor>>)> {
+    ) -> Result<(Self, watch::Receiver<Arc<Vec<StoredMonitor>>>)> {
         if crate::db::monitors_table_empty(&pool).await? {
             import_legacy_toml(&pool, legacy_path, defaults).await?;
         }
@@ -569,12 +572,13 @@ impl MonitorStore {
             crate::db::backfill_monitor_id(&pool, m.id, m.config.name()).await?;
         }
 
-        let (tx, rx) = watch::channel(monitors.clone());
-        let store = Self { inner: Arc::new(RwLock::new(monitors)), pool, tx };
+        let snapshot = Arc::new(monitors);
+        let (tx, rx) = watch::channel(snapshot.clone());
+        let store = Self { inner: Arc::new(RwLock::new(snapshot)), pool, tx };
         Ok((store, rx))
     }
 
-    pub async fn list(&self) -> Vec<StoredMonitor> {
+    pub async fn list(&self) -> Arc<Vec<StoredMonitor>> {
         self.inner.read().await.clone()
     }
 
@@ -585,60 +589,66 @@ impl MonitorStore {
 
     /// Add a new monitor, returning its assigned id. Name uniqueness is enforced.
     pub async fn add(&self, monitor: MonitorConfig) -> Result<i64> {
-        let mut monitors = self.inner.write().await;
-        if monitors.iter().any(|m| m.config.name() == monitor.name()) {
+        let mut guard = self.inner.write().await;
+        if guard.iter().any(|m| m.config.name() == monitor.name()) {
             anyhow::bail!("a monitor named '{}' already exists", monitor.name());
         }
         let id = crate::db::insert_monitor(&self.pool, monitor.name(), &monitor).await?;
+        let mut monitors = (**guard).clone();
         monitors.push(StoredMonitor { id, config: monitor });
-        self.notify(&monitors);
+        *guard = Arc::new(monitors);
+        self.notify(&guard);
         Ok(id)
     }
 
     /// Set a monitor's enabled flag by id, persisting and notifying watchers (the
     /// scheduler reacts via hot-reload). Returns `false` if no such monitor.
     pub async fn set_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
-        let mut monitors = self.inner.write().await;
-        let Some(m) = monitors.iter_mut().find(|m| m.id == id) else {
+        let mut guard = self.inner.write().await;
+        let Some(pos) = guard.iter().position(|m| m.id == id) else {
             return Ok(false);
         };
-        if m.config.enabled() == enabled {
+        if guard[pos].config.enabled() == enabled {
             return Ok(true); // no-op; avoid a needless write/notify
         }
-        m.config.set_enabled(enabled);
-        crate::db::update_monitor_row(&self.pool, id, m.config.name(), &m.config).await?;
-        self.notify(&monitors);
+        let mut monitors = (**guard).clone();
+        monitors[pos].config.set_enabled(enabled);
+        crate::db::update_monitor_row(&self.pool, id, monitors[pos].config.name(), &monitors[pos].config).await?;
+        *guard = Arc::new(monitors);
+        self.notify(&guard);
         Ok(true)
     }
 
     /// Replace the monitor with `id`, preserving its position. Returns `false` if
     /// no monitor with that id exists. Persists and notifies watchers.
     pub async fn update(&self, id: i64, monitor: MonitorConfig) -> Result<bool> {
-        let mut monitors = self.inner.write().await;
-        let Some(slot) = monitors.iter_mut().find(|m| m.id == id) else {
+        let mut guard = self.inner.write().await;
+        let Some(pos) = guard.iter().position(|m| m.id == id) else {
             return Ok(false);
         };
         crate::db::update_monitor_row(&self.pool, id, monitor.name(), &monitor).await?;
-        slot.config = monitor;
-        self.notify(&monitors);
+        let mut monitors = (**guard).clone();
+        monitors[pos].config = monitor;
+        *guard = Arc::new(monitors);
+        self.notify(&guard);
         Ok(true)
     }
 
     /// Returns `true` if found and removed, `false` if not found.
     pub async fn remove(&self, id: i64) -> Result<bool> {
-        let mut monitors = self.inner.write().await;
-        let before = monitors.len();
-        monitors.retain(|m| m.id != id);
-        if monitors.len() == before {
+        let mut guard = self.inner.write().await;
+        if !guard.iter().any(|m| m.id == id) {
             return Ok(false);
         }
         crate::db::delete_monitor_row(&self.pool, id).await?;
-        self.notify(&monitors);
+        let monitors: Vec<StoredMonitor> = guard.iter().filter(|m| m.id != id).cloned().collect();
+        *guard = Arc::new(monitors);
+        self.notify(&guard);
         Ok(true)
     }
 
-    fn notify(&self, monitors: &[StoredMonitor]) {
-        let _ = self.tx.send(monitors.to_vec());
+    fn notify(&self, snapshot: &Arc<Vec<StoredMonitor>>) {
+        let _ = self.tx.send(snapshot.clone());
     }
 }
 
