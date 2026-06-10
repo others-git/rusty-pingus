@@ -13,7 +13,7 @@
   <Category>Network:Management</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL/>
-  <Icon/>
+  <Icon>https://raw.githubusercontent.com/others-git/rusty-pingus/main/assets/icon.png</Icon>
   <!--
     CAP_NET_RAW and CAP_NET_ADMIN are required for ICMP ping and traceroute
     probes. If your runtime does not support file capabilities (rootless Docker,
