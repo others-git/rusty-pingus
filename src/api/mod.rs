@@ -16,7 +16,7 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::db;
-use crate::monitors::{MonitorConfig, MonitorStore};
+use crate::monitors::{MonitorConfig, MonitorStore, StoredMonitor};
 use crate::probe::ProbeResult;
 
 #[derive(Clone)]
@@ -38,6 +38,7 @@ pub struct AppState {
 /// `ProbeResult` (no extra DB query) and broadcast to connected dashboards.
 #[derive(Clone, Debug, Serialize)]
 pub struct StatusUpdate {
+    pub id: i64,
     pub name: String,
     pub protocol: String,
     pub endpoint: String,
@@ -48,9 +49,12 @@ pub struct StatusUpdate {
     pub last_checked_at: String,
 }
 
-impl From<&ProbeResult> for StatusUpdate {
-    fn from(r: &ProbeResult) -> Self {
+impl StatusUpdate {
+    /// Build a live update from a probe result, tagged with the monitor's stable
+    /// id (the dashboard matches updates to cards by id).
+    pub fn from_result(id: i64, r: &ProbeResult) -> Self {
         Self {
+            id,
             name: r.monitor_name.clone(),
             protocol: r.protocol.clone(),
             endpoint: r.endpoint.clone(),
@@ -88,10 +92,9 @@ pub async fn monitor_stream(
 /// A monitor's protocol + endpoint from the current config, or neutral fallbacks
 /// when it is no longer configured (e.g. history for a since-deleted monitor).
 /// These are no longer stored per probe row, so responses source them here.
-async fn monitor_identity(state: &AppState, name: &str) -> (String, String) {
-    state.monitors.list().await.iter()
-        .find(|m| m.name() == name)
-        .map(|m| (m.protocol().to_string(), m.endpoint()))
+async fn monitor_identity(state: &AppState, id: i64) -> (String, String) {
+    state.monitors.get(id).await
+        .map(|m| (m.config.protocol().to_string(), m.config.endpoint()))
         .unwrap_or_else(|| ("unknown".to_string(), String::new()))
 }
 
@@ -99,6 +102,7 @@ async fn monitor_identity(state: &AppState, name: &str) -> (String, String) {
 
 #[derive(Serialize)]
 pub struct MonitorStatus {
+    pub id: i64,
     pub name: String,
     pub protocol: String,
     pub endpoint: String,
@@ -122,33 +126,35 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
     let configured = state.monitors.list().await;
     // Batched: one query for every monitor's latest status, one for 24h uptime —
     // instead of two queries per monitor. protocol/endpoint come from the config
-    // (no longer stored per probe row).
-    let latest: std::collections::HashMap<String, db::CurrentStatus> = db::get_current_status(&state.pool)
+    // (no longer stored per probe row). Both are keyed by the stable monitor id.
+    let latest: std::collections::HashMap<i64, db::CurrentStatus> = db::get_current_status(&state.pool)
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|s| (s.monitor_name.clone(), s))
+        .map(|s| (s.monitor_id, s))
         .collect();
     let uptime = db::get_uptime_24h_all(&state.pool).await.unwrap_or_default();
 
     let mut result = Vec::with_capacity(configured.len());
     for m in &configured {
-        let name = m.name().to_string();
-        let protocol = m.protocol().to_string();
-        let endpoint = m.endpoint();
-        let enabled = m.enabled();
+        let id = m.id;
+        let name = m.config.name().to_string();
+        let protocol = m.config.protocol().to_string();
+        let endpoint = m.config.endpoint();
+        let enabled = m.config.enabled();
         // Raw per-monitor retention (None → global default applies at the frontend).
-        let retention_hours = match m {
-            crate::monitors::MonitorConfig::Http(c) => c.retention_hours,
-            crate::monitors::MonitorConfig::Tcp(c) => c.retention_hours,
-            crate::monitors::MonitorConfig::Icmp(c) => c.retention_hours,
-            crate::monitors::MonitorConfig::PublicIp(c) => c.retention_hours,
-            crate::monitors::MonitorConfig::Border(c) => c.retention_hours,
-            crate::monitors::MonitorConfig::Traceroute(c) => c.retention_hours,
+        let retention_hours = match &m.config {
+            MonitorConfig::Http(c) => c.retention_hours,
+            MonitorConfig::Tcp(c) => c.retention_hours,
+            MonitorConfig::Icmp(c) => c.retention_hours,
+            MonitorConfig::PublicIp(c) => c.retention_hours,
+            MonitorConfig::Border(c) => c.retention_hours,
+            MonitorConfig::Traceroute(c) => c.retention_hours,
         };
-        match latest.get(&name) {
+        match latest.get(&id) {
             Some(s) => result.push(MonitorStatus {
-                uptime_24h: uptime.get(&name).copied(),
+                id,
+                uptime_24h: uptime.get(&id).copied(),
                 protocol,
                 endpoint,
                 enabled,
@@ -161,6 +167,7 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
                 name,
             }),
             None => result.push(MonitorStatus {
+                id,
                 name,
                 protocol,
                 endpoint,
@@ -178,6 +185,39 @@ pub async fn list_monitors(State(state): State<AppState>) -> impl IntoResponse {
     Json(result).into_response()
 }
 
+/// `GET /api/monitors/:id` — the single monitor's current status (so the detail
+/// page can render the name/protocol from the id in its URL).
+pub async fn get_monitor(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+    let Some(m) = state.monitors.get(id).await else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "monitor not found" }))).into_response();
+    };
+    let latest = db::get_latest_status(&state.pool, id).await.ok().flatten();
+    let uptime_24h = db::get_uptime(&state.pool, id, 86_400).await.ok().flatten();
+    let retention_hours = match &m.config {
+        MonitorConfig::Http(c) => c.retention_hours,
+        MonitorConfig::Tcp(c) => c.retention_hours,
+        MonitorConfig::Icmp(c) => c.retention_hours,
+        MonitorConfig::PublicIp(c) => c.retention_hours,
+        MonitorConfig::Border(c) => c.retention_hours,
+        MonitorConfig::Traceroute(c) => c.retention_hours,
+    };
+    let status = MonitorStatus {
+        id,
+        name: m.config.name().to_string(),
+        protocol: m.config.protocol().to_string(),
+        endpoint: m.config.endpoint(),
+        enabled: m.config.enabled(),
+        retention_hours,
+        uptime_24h,
+        status: latest.as_ref().map(|s| s.status.clone()).unwrap_or_else(|| "pending".to_string()),
+        last_checked_at: latest.as_ref().map(|s| s.checked_at.clone()),
+        response_time_ms: latest.as_ref().and_then(|s| s.response_time_ms),
+        failure_reason: latest.as_ref().and_then(|s| s.failure_reason.clone()),
+        detail: latest.as_ref().and_then(|s| s.detail.clone()),
+    };
+    Json(status).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct HistoryParams {
     pub from: Option<DateTime<Utc>>,
@@ -187,22 +227,21 @@ pub struct HistoryParams {
 
 pub async fn monitor_history(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
     Query(params): Query<HistoryParams>,
 ) -> impl IntoResponse {
-    let exists = db::monitor_exists(&state.pool, &name).await.unwrap_or(false);
-    if !exists {
+    if state.monitors.get(id).await.is_none() {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "monitor_not_found", "name": name })),
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
         ).into_response();
     }
     let limit = params.limit.unwrap_or(100).min(1000);
-    match db::get_history(&state.pool, &name, params.from, params.to, limit).await {
+    match db::get_history(&state.pool, id, params.from, params.to, limit).await {
         Ok(mut rows) => {
             // protocol/endpoint are not stored per row; supply them from config
             // (the detail page relies on `protocol` to choose its view).
-            let (protocol, endpoint) = monitor_identity(&state, &name).await;
+            let (protocol, endpoint) = monitor_identity(&state, id).await;
             for r in &mut rows { r.protocol = protocol.clone(); r.endpoint = endpoint.clone(); }
             Json(rows).into_response()
         }
@@ -223,20 +262,19 @@ pub struct UptimeResponse {
 
 pub async fn monitor_uptime(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let exists = db::monitor_exists(&state.pool, &name).await.unwrap_or(false);
-    if !exists {
+    if state.monitors.get(id).await.is_none() {
         return (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "monitor_not_found", "name": name })),
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
         ).into_response();
     }
     let (u1h, u24h, u7d, u30d) = tokio::join!(
-        db::get_uptime(&state.pool, &name, 3_600),
-        db::get_uptime(&state.pool, &name, 86_400),
-        db::get_uptime(&state.pool, &name, 604_800),
-        db::get_uptime(&state.pool, &name, 2_592_000),
+        db::get_uptime(&state.pool, id, 3_600),
+        db::get_uptime(&state.pool, id, 86_400),
+        db::get_uptime(&state.pool, id, 604_800),
+        db::get_uptime(&state.pool, id, 2_592_000),
     );
     Json(UptimeResponse {
         uptime_1h: u1h.ok().flatten(),
@@ -255,14 +293,14 @@ pub struct SeriesParams {
 
 pub async fn monitor_series(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
     Query(params): Query<SeriesParams>,
 ) -> impl IntoResponse {
     let to = params.to.unwrap_or_else(Utc::now);
     let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
     let buckets = params.buckets.unwrap_or(300).clamp(50, 1000);
 
-    match db::get_series(&state.pool, &name, from, to, buckets).await {
+    match db::get_series(&state.pool, id, from, to, buckets).await {
         Ok(series) => Json(series).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "DB error in monitor_series");
@@ -282,12 +320,12 @@ pub struct TraceParams {
 /// `GET /api/monitors/:name/traceroute?from&to` — per-hop aggregates over a range.
 pub async fn monitor_traceroute(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
     Query(params): Query<TraceParams>,
 ) -> impl IntoResponse {
     let to = params.to.unwrap_or_else(Utc::now);
     let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(1));
-    match db::get_traceroute_hops(&state.pool, &name, from, to).await {
+    match db::get_traceroute_hops(&state.pool, id, from, to).await {
         Ok(hops) => Json(hops).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "DB error in monitor_traceroute");
@@ -300,9 +338,9 @@ pub async fn monitor_traceroute(
 /// UI brush knows its bounds. `{ "from": null, "to": null }` when there is no data.
 pub async fn monitor_traceroute_extent(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    match db::get_traceroute_extent(&state.pool, &name).await {
+    match db::get_traceroute_extent(&state.pool, id).await {
         Ok(Some((from, to))) => Json(serde_json::json!({ "from": from, "to": to })).into_response(),
         Ok(None) => Json(serde_json::json!({ "from": null, "to": null })).into_response(),
         Err(e) => {
@@ -325,12 +363,12 @@ pub struct SegmentsParams {
 /// regardless of probe frequency (bounded by changes, not probe count).
 pub async fn monitor_segments(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
     Query(params): Query<SegmentsParams>,
 ) -> impl IntoResponse {
     let to = params.to.unwrap_or_else(Utc::now);
     let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
-    match db::get_state_segments(&state.pool, &name, from.timestamp_millis(), to.timestamp_millis()).await {
+    match db::get_state_segments(&state.pool, id, from.timestamp_millis(), to.timestamp_millis()).await {
         Ok(segs) => Json(segs).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "DB error in monitor_segments");
@@ -344,18 +382,17 @@ pub async fn monitor_segments(
 /// bounds. Works for all monitor types (use traceroute/extent for traceroute).
 pub async fn monitor_extent(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let retention_hours = state.monitors.list().await.iter()
-        .find(|m| m.name() == name)
-        .map(|m| m.retention_hours(state.global_retention_days))
+    let retention_hours = state.monitors.get(id).await
+        .map(|m| m.config.retention_hours(state.global_retention_days))
         .unwrap_or(state.global_retention_days.saturating_mul(24));
 
     let ms_to_iso = |ms: i64| {
         DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
     };
 
-    match db::get_probe_extent(&state.pool, &name).await {
+    match db::get_probe_extent(&state.pool, id).await {
         Ok(Some((lo, hi))) => Json(serde_json::json!({
             "from": ms_to_iso(lo),
             "to": ms_to_iso(hi),
@@ -392,10 +429,50 @@ pub async fn add_monitor(
     }
 
     match state.monitors.add(monitor).await {
-        Ok(()) => (StatusCode::CREATED, Json(state.monitors.list().await)).into_response(),
+        Ok(_id) => (StatusCode::CREATED, Json(state.monitors.list().await)).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "errors": [e.to_string()] })),
+        ).into_response(),
+    }
+}
+
+/// `PUT /api/monitors/:id` — replace a monitor's configuration in place.
+///
+/// Keyed by the stable id, so the name is just a label and **renaming is
+/// allowed**: history follows the id. Validation runs against the *other*
+/// monitors so the edited one may keep (or change) its own name.
+pub async fn update_monitor(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(monitor): Json<MonitorConfig>,
+) -> impl IntoResponse {
+    let all = state.monitors.list().await;
+    if !all.iter().any(|m| m.id == id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor not found" })),
+        ).into_response();
+    }
+
+    let others: Vec<StoredMonitor> = all.into_iter().filter(|m| m.id != id).collect();
+    let errors = validate_monitor(&monitor, &others);
+    if !errors.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "errors": errors })),
+        ).into_response();
+    }
+
+    match state.monitors.update(id, monitor).await {
+        Ok(true) => Json(state.monitors.list().await).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor not found" })),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
         ).into_response(),
     }
 }
@@ -405,14 +482,14 @@ pub struct EnabledBody {
     pub enabled: bool,
 }
 
-/// `POST /api/monitors/:name/enabled` — enable or disable a monitor without
+/// `POST /api/monitors/:id/enabled` — enable or disable a monitor without
 /// deleting it. Persists + notifies (the scheduler reacts via hot-reload).
 pub async fn set_monitor_enabled(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
     Json(body): Json<EnabledBody>,
 ) -> impl IntoResponse {
-    match state.monitors.set_enabled(&name, body.enabled).await {
+    match state.monitors.set_enabled(id, body.enabled).await {
         Ok(true) => Json(state.monitors.list().await).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -427,15 +504,15 @@ pub async fn set_monitor_enabled(
 
 pub async fn delete_monitor(
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    match state.monitors.remove(&name).await {
+    match state.monitors.remove(id).await {
         Ok(true) => {
             // Purge the monitor's stored probe results so it no longer surfaces in
             // the dashboard's status list (derived from probe_results). Best-effort:
             // the config is already gone, so a purge failure must not fail the request.
-            if let Err(e) = db::delete_results(&state.pool, &name).await {
-                tracing::warn!(monitor = %name, error = %e, "Failed to purge probe results for deleted monitor");
+            if let Err(e) = db::delete_results(&state.pool, id).await {
+                tracing::warn!(monitor_id = id, error = %e, "Failed to purge probe results for deleted monitor");
             }
             Json(state.monitors.list().await).into_response()
         }
@@ -452,7 +529,7 @@ pub async fn delete_monitor(
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<String> {
+fn validate_monitor(monitor: &MonitorConfig, existing: &[StoredMonitor]) -> Vec<String> {
     let mut errors = Vec::new();
 
     let name = monitor.name();
@@ -460,9 +537,7 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[MonitorConfig]) -> Vec<
         errors.push("name is required".into());
     } else if name.len() > 100 {
         errors.push("name must be 100 characters or fewer".into());
-    } else if name.contains('/') || name.contains('\\') {
-        errors.push("name must not contain / or \\".into());
-    } else if existing.iter().any(|m| m.name() == name) {
+    } else if existing.iter().any(|m| m.config.name() == name) {
         errors.push(format!("a monitor named '{}' already exists", name));
     }
 

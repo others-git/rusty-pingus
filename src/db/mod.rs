@@ -1,11 +1,79 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
+use crate::monitors::MonitorConfig;
 use crate::probe::ProbeResult;
+
+// ── Monitor storage (config rows) ──────────────────────────────────────────────
+
+/// Insert a monitor row (name + JSON-serialised config), returning its new id.
+pub async fn insert_monitor(pool: &SqlitePool, name: &str, config: &MonitorConfig) -> Result<i64> {
+    let json = serde_json::to_string(config)?;
+    let id: i64 = sqlx::query("INSERT INTO monitors (name, config) VALUES (?, ?) RETURNING id")
+        .bind(name)
+        .bind(json)
+        .fetch_one(pool)
+        .await?
+        .try_get("id")?;
+    Ok(id)
+}
+
+/// Replace a monitor's name + config by id.
+pub async fn update_monitor_row(pool: &SqlitePool, id: i64, name: &str, config: &MonitorConfig) -> Result<()> {
+    let json = serde_json::to_string(config)?;
+    sqlx::query("UPDATE monitors SET name = ?, config = ? WHERE id = ?")
+        .bind(name)
+        .bind(json)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete a monitor row by id.
+pub async fn delete_monitor_row(pool: &SqlitePool, id: i64) -> Result<()> {
+    sqlx::query("DELETE FROM monitors WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// All monitor rows as `(id, config)`, ordered by id (insertion order).
+pub async fn list_monitor_rows(pool: &SqlitePool) -> Result<Vec<(i64, MonitorConfig)>> {
+    let rows = sqlx::query("SELECT id, config FROM monitors ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: i64 = row.try_get("id")?;
+        let json: String = row.try_get("config")?;
+        let config: MonitorConfig = serde_json::from_str(&json)
+            .with_context(|| format!("Invalid stored monitor config for id {id}"))?;
+        out.push((id, config));
+    }
+    Ok(out)
+}
+
+/// Whether the monitors table has no rows (used to gate one-time import).
+pub async fn monitors_table_empty(pool: &SqlitePool) -> Result<bool> {
+    let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monitors").fetch_one(pool).await?;
+    Ok(cnt == 0)
+}
+
+/// One-time backfill: tag a monitor's existing name-keyed history rows with its
+/// new stable id. Idempotent — only touches rows whose monitor_id is still null.
+pub async fn backfill_monitor_id(pool: &SqlitePool, monitor_id: i64, name: &str) -> Result<()> {
+    sqlx::query("UPDATE probe_results SET monitor_id = ? WHERE monitor_name = ? AND monitor_id IS NULL")
+        .bind(monitor_id).bind(name).execute(pool).await?;
+    sqlx::query("UPDATE traceroute_runs SET monitor_id = ? WHERE monitor_name = ? AND monitor_id IS NULL")
+        .bind(monitor_id).bind(name).execute(pool).await?;
+    Ok(())
+}
 
 pub async fn init(path: &str) -> Result<SqlitePool> {
     // Pragmas are applied per connection (via connect options) so every pooled
@@ -49,14 +117,16 @@ fn epoch_ms_to_rfc3339(ms: i64) -> String {
     DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339()
 }
 
-pub async fn insert_result(pool: &SqlitePool, result: &ProbeResult) -> Result<()> {
+pub async fn insert_result(pool: &SqlitePool, monitor_id: i64, result: &ProbeResult) -> Result<()> {
     // protocol/endpoint are constant per monitor and supplied from config at the
     // API layer, so they are no longer duplicated on every row. checked_at is an
-    // integer epoch (ms).
+    // integer epoch (ms). monitor_name is still written (denormalised) so the old
+    // NOT NULL column keeps working; monitor_id is the stable key reads use.
     sqlx::query(
-        "INSERT INTO probe_results (monitor_name, status, response_time_ms, failure_reason, detail, checked_at)
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO probe_results (monitor_id, monitor_name, status, response_time_ms, failure_reason, detail, checked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(monitor_id)
     .bind(&result.monitor_name)
     .bind(&result.status)
     .bind(result.response_time_ms.map(|v| v as i64))
@@ -70,7 +140,7 @@ pub async fn insert_result(pool: &SqlitePool, result: &ProbeResult) -> Result<()
 
 #[derive(Debug, Serialize)]
 pub struct CurrentStatus {
-    pub monitor_name: String,
+    pub monitor_id: i64,
     /// Supplied by the API layer from the monitor config (not stored per row).
     pub protocol: String,
     pub endpoint: String,
@@ -83,7 +153,7 @@ pub struct CurrentStatus {
 
 fn row_to_current(row: &sqlx::sqlite::SqliteRow) -> Result<CurrentStatus> {
     Ok(CurrentStatus {
-        monitor_name: row.try_get("monitor_name")?,
+        monitor_id: row.try_get("monitor_id")?,
         protocol: String::new(), // filled from config by the API layer
         endpoint: String::new(),
         status: row.try_get("status")?,
@@ -96,15 +166,15 @@ fn row_to_current(row: &sqlx::sqlite::SqliteRow) -> Result<CurrentStatus> {
 
 /// Latest probe result for a single monitor. O(1) index seek — used by the
 /// dashboard so its cost scales with the number of monitors, not total rows.
-pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<Option<CurrentStatus>> {
+pub async fn get_latest_status(pool: &SqlitePool, monitor_id: i64) -> Result<Option<CurrentStatus>> {
     let row = sqlx::query(
-        "SELECT monitor_name, status, response_time_ms, failure_reason, detail, checked_at
+        "SELECT monitor_id, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
-         WHERE monitor_name = ?
+         WHERE monitor_id = ?
          ORDER BY checked_at DESC
          LIMIT 1",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .fetch_optional(pool)
     .await?;
     row.as_ref().map(row_to_current).transpose()
@@ -112,10 +182,10 @@ pub async fn get_latest_status(pool: &SqlitePool, monitor_name: &str) -> Result<
 
 pub async fn get_current_status(pool: &SqlitePool) -> Result<Vec<CurrentStatus>> {
     let rows = sqlx::query(
-        "SELECT monitor_name, status, response_time_ms, failure_reason, detail, checked_at
+        "SELECT monitor_id, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
-         WHERE id IN (SELECT MAX(id) FROM probe_results GROUP BY monitor_name)
-         ORDER BY monitor_name",
+         WHERE id IN (SELECT MAX(id) FROM probe_results WHERE monitor_id IS NOT NULL GROUP BY monitor_id)
+         ORDER BY monitor_id",
     )
     .fetch_all(pool)
     .await?;
@@ -138,7 +208,7 @@ pub struct HistoryRow {
 
 pub async fn get_history(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
     limit: i64,
@@ -149,11 +219,11 @@ pub async fn get_history(
     let rows = sqlx::query(
         "SELECT id, monitor_name, status, response_time_ms, failure_reason, detail, checked_at
          FROM probe_results
-         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
+         WHERE monitor_id = ? AND checked_at >= ? AND checked_at <= ?
          ORDER BY checked_at DESC
          LIMIT ?",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_ms)
     .bind(to_ms)
     .bind(limit)
@@ -176,7 +246,7 @@ pub async fn get_history(
 
 pub async fn get_uptime(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     window_secs: i64,
 ) -> Result<Option<f64>> {
     // Long windows are served from the per-minute rollup (bounded cost); short
@@ -185,9 +255,9 @@ pub async fn get_uptime(
         let from_epoch = (Utc::now() - chrono::Duration::seconds(window_secs)).timestamp();
         let row = sqlx::query(
             "SELECT SUM(count) AS total, SUM(up_count) AS up
-             FROM probe_rollup_1m WHERE monitor_name = ? AND bucket_epoch >= ?",
+             FROM probe_rollup_1m WHERE monitor_id = ? AND bucket_epoch >= ?",
         )
-        .bind(monitor_name)
+        .bind(monitor_id)
         .bind(from_epoch)
         .fetch_one(pool)
         .await?;
@@ -205,9 +275,9 @@ pub async fn get_uptime(
     let row = sqlx::query(
         "SELECT COUNT(*) as total, SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) as up_count
          FROM probe_results
-         WHERE monitor_name = ? AND checked_at >= ?",
+         WHERE monitor_id = ? AND checked_at >= ?",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_ms)
     .fetch_one(pool)
     .await?;
@@ -221,15 +291,15 @@ pub async fn get_uptime(
 }
 
 /// 24h uptime % for every monitor in one query (for the dashboard list, so it
-/// doesn't fan out a per-monitor uptime query). Keyed by monitor name; monitors
+/// doesn't fan out a per-monitor uptime query). Keyed by monitor id; monitors
 /// with no probes in the window are absent.
-pub async fn get_uptime_24h_all(pool: &SqlitePool) -> Result<std::collections::HashMap<String, f64>> {
+pub async fn get_uptime_24h_all(pool: &SqlitePool) -> Result<std::collections::HashMap<i64, f64>> {
     let from_ms = (Utc::now() - chrono::Duration::hours(24)).timestamp_millis();
     let rows = sqlx::query(
-        "SELECT monitor_name,
+        "SELECT monitor_id,
                 COUNT(*) AS total,
                 SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END) AS up_count
-         FROM probe_results WHERE checked_at >= ? GROUP BY monitor_name",
+         FROM probe_results WHERE checked_at >= ? AND monitor_id IS NOT NULL GROUP BY monitor_id",
     )
     .bind(from_ms)
     .fetch_all(pool)
@@ -239,8 +309,8 @@ pub async fn get_uptime_24h_all(pool: &SqlitePool) -> Result<std::collections::H
         let total: i64 = row.try_get("total").unwrap_or(0);
         if total > 0 {
             let up: i64 = row.try_get("up_count").unwrap_or(0);
-            let name: String = row.try_get("monitor_name")?;
-            map.insert(name, (up as f64 / total as f64) * 100.0);
+            let id: i64 = row.try_get("monitor_id")?;
+            map.insert(id, (up as f64 / total as f64) * 100.0);
         }
     }
     Ok(map)
@@ -261,7 +331,7 @@ pub struct SeriesBucket {
 /// Bounds the output regardless of how many raw rows fall in the range.
 pub async fn get_series(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     buckets: i64,
@@ -278,7 +348,7 @@ pub async fn get_series(
     // range yet (e.g. startup backfill not finished), fall back to the raw path so
     // results are correct (just not yet fast). Finer ranges always use raw.
     if span_secs / n >= 60 {
-        let rollup = get_series_rollup(pool, monitor_name, from_epoch, to_epoch, n, span_secs).await?;
+        let rollup = get_series_rollup(pool, monitor_id, from_epoch, to_epoch, n, span_secs).await?;
         if !rollup.is_empty() {
             return Ok(rollup);
         }
@@ -297,7 +367,7 @@ pub async fn get_series(
                 COUNT(*) AS cnt,
                 AVG(CASE WHEN status = 'up' THEN 1.0 ELSE 0.0 END) AS up_ratio
          FROM probe_results
-         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
+         WHERE monitor_id = ? AND checked_at >= ? AND checked_at <= ?
          GROUP BY bucket
          ORDER BY bucket",
     )
@@ -305,7 +375,7 @@ pub async fn get_series(
     .bind(from_ms)
     .bind(n)
     .bind(span_ms)
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_ms)
     .bind(to_ms)
     .fetch_all(pool)
@@ -334,7 +404,7 @@ pub async fn get_series(
 /// bounded buckets. avg = SUM(sum_ms)/SUM(up_count) (over successful probes).
 async fn get_series_rollup(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     from_epoch: i64,
     to_epoch: i64,
     n: i64,
@@ -348,7 +418,7 @@ async fn get_series_rollup(
                 MAX(max_ms) AS max_ms,
                 SUM(count) AS cnt
          FROM probe_rollup_1m
-         WHERE monitor_name = ? AND bucket_epoch >= ? AND bucket_epoch <= ?
+         WHERE monitor_id = ? AND bucket_epoch >= ? AND bucket_epoch <= ?
          GROUP BY bucket
          ORDER BY bucket",
     )
@@ -356,7 +426,7 @@ async fn get_series_rollup(
     .bind(from_epoch)
     .bind(n)
     .bind(span_secs)
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_epoch)
     .bind(to_epoch)
     .fetch_all(pool)
@@ -410,8 +480,8 @@ pub async fn earliest_raw_minute(pool: &SqlitePool) -> Result<Option<i64>> {
 pub async fn roll_up_range(pool: &SqlitePool, from_epoch: i64, to_epoch: i64) -> Result<u64> {
     let result = sqlx::query(
         "INSERT OR REPLACE INTO probe_rollup_1m
-            (monitor_name, bucket_epoch, count, up_count, sum_ms, min_ms, max_ms)
-         SELECT monitor_name,
+            (monitor_id, bucket_epoch, count, up_count, sum_ms, min_ms, max_ms)
+         SELECT monitor_id,
                 (checked_at / 60000) * 60 AS b,
                 COUNT(*),
                 SUM(CASE WHEN status = 'up' THEN 1 ELSE 0 END),
@@ -419,8 +489,8 @@ pub async fn roll_up_range(pool: &SqlitePool, from_epoch: i64, to_epoch: i64) ->
                 MIN(response_time_ms),
                 MAX(response_time_ms)
          FROM probe_results
-         WHERE checked_at >= ? AND checked_at < ?
-         GROUP BY monitor_name, b",
+         WHERE checked_at >= ? AND checked_at < ? AND monitor_id IS NOT NULL
+         GROUP BY monitor_id, b",
     )
     .bind(from_epoch * 1000)
     .bind(to_epoch * 1000)
@@ -448,9 +518,9 @@ pub async fn prune_old_results(pool: &SqlitePool, retention_days: u64) -> Result
 }
 
 /// Delete probe_results for one monitor older than `cutoff_ms` (epoch ms).
-pub async fn prune_monitor_results(pool: &SqlitePool, monitor_name: &str, cutoff_ms: i64) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM probe_results WHERE monitor_name = ? AND checked_at < ?")
-        .bind(monitor_name)
+pub async fn prune_monitor_results(pool: &SqlitePool, monitor_id: i64, cutoff_ms: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM probe_results WHERE monitor_id = ? AND checked_at < ?")
+        .bind(monitor_id)
         .bind(cutoff_ms)
         .execute(pool)
         .await?;
@@ -458,9 +528,9 @@ pub async fn prune_monitor_results(pool: &SqlitePool, monitor_name: &str, cutoff
 }
 
 /// Delete rollup rows for one monitor older than `cutoff_epoch` (epoch seconds).
-pub async fn prune_monitor_rollups(pool: &SqlitePool, monitor_name: &str, cutoff_epoch: i64) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM probe_rollup_1m WHERE monitor_name = ? AND bucket_epoch < ?")
-        .bind(monitor_name)
+pub async fn prune_monitor_rollups(pool: &SqlitePool, monitor_id: i64, cutoff_epoch: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM probe_rollup_1m WHERE monitor_id = ? AND bucket_epoch < ?")
+        .bind(monitor_id)
         .bind(cutoff_epoch)
         .execute(pool)
         .await?;
@@ -469,11 +539,11 @@ pub async fn prune_monitor_rollups(pool: &SqlitePool, monitor_name: &str, cutoff
 
 /// The earliest and latest probe times (epoch ms) for a monitor. Used to
 /// supply brush bounds on the detail page. Returns None when there is no data.
-pub async fn get_probe_extent(pool: &SqlitePool, monitor_name: &str) -> Result<Option<(i64, i64)>> {
+pub async fn get_probe_extent(pool: &SqlitePool, monitor_id: i64) -> Result<Option<(i64, i64)>> {
     let row = sqlx::query(
-        "SELECT MIN(checked_at) AS lo, MAX(checked_at) AS hi FROM probe_results WHERE monitor_name = ?",
+        "SELECT MIN(checked_at) AS lo, MAX(checked_at) AS hi FROM probe_results WHERE monitor_id = ?",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .fetch_one(pool)
     .await?;
     let lo: Option<i64> = row.try_get("lo")?;
@@ -500,16 +570,16 @@ pub struct StateSegment {
 /// so a fast monitor's full window is covered regardless of probe frequency.
 pub async fn get_state_segments(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Vec<StateSegment>> {
     let rows = sqlx::query(
         "SELECT detail, checked_at FROM probe_results
-         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?
+         WHERE monitor_id = ? AND checked_at >= ? AND checked_at <= ?
          ORDER BY checked_at ASC",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_ms)
     .bind(to_ms)
     .fetch_all(pool)
@@ -544,17 +614,17 @@ pub async fn get_state_segments(
 
 /// Delete all stored probe results (and rollups) for a monitor. Returns the
 /// number of raw rows removed.
-pub async fn delete_results(pool: &SqlitePool, monitor_name: &str) -> Result<u64> {
-    let result = sqlx::query("DELETE FROM probe_results WHERE monitor_name = ?")
-        .bind(monitor_name)
+pub async fn delete_results(pool: &SqlitePool, monitor_id: i64) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM probe_results WHERE monitor_id = ?")
+        .bind(monitor_id)
         .execute(pool)
         .await?;
-    sqlx::query("DELETE FROM probe_rollup_1m WHERE monitor_name = ?")
-        .bind(monitor_name)
+    sqlx::query("DELETE FROM probe_rollup_1m WHERE monitor_id = ?")
+        .bind(monitor_id)
         .execute(pool)
         .await?;
     // Also clear any traceroute data for this monitor (best-effort; ignore if none).
-    let _ = delete_traceroute(pool, monitor_name).await;
+    let _ = delete_traceroute(pool, monitor_id).await;
     Ok(result.rows_affected())
 }
 
@@ -586,6 +656,7 @@ pub struct TraceRunInput {
 /// interned with a single lookup.
 pub async fn insert_traceroute(
     pool: &SqlitePool,
+    monitor_id: i64,
     monitor_name: &str,
     checked_at: DateTime<Utc>,
     run: &TraceRunInput,
@@ -593,9 +664,10 @@ pub async fn insert_traceroute(
     let mut tx = pool.begin().await?;
 
     let run_id: i64 = sqlx::query(
-        "INSERT INTO traceroute_runs (monitor_name, checked_at, reached, hop_count)
-         VALUES (?, ?, ?, ?) RETURNING id",
+        "INSERT INTO traceroute_runs (monitor_id, monitor_name, checked_at, reached, hop_count)
+         VALUES (?, ?, ?, ?, ?) RETURNING id",
     )
+    .bind(monitor_id)
     .bind(monitor_name)
     .bind(checked_at.timestamp_millis())
     .bind(if run.reached { 1 } else { 0 })
@@ -666,7 +738,7 @@ pub struct TraceHopAgg {
 /// address taken from the most recent run in range.
 pub async fn get_traceroute_hops(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Result<Vec<TraceHopAgg>> {
@@ -686,11 +758,11 @@ pub async fn get_traceroute_hops(
                 SUM(CASE WHEN h.addr_id IS NOT NULL THEN 1 ELSE 0 END) AS responded
          FROM traceroute_hops h
          JOIN traceroute_runs r ON h.run_id = r.id
-         WHERE r.monitor_name = ? AND r.checked_at >= ? AND r.checked_at <= ?
+         WHERE r.monitor_id = ? AND r.checked_at >= ? AND r.checked_at <= ?
          GROUP BY h.hop_no
          ORDER BY h.hop_no",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_ms)
     .bind(to_ms)
     .fetch_all(pool)
@@ -699,9 +771,9 @@ pub async fn get_traceroute_hops(
     // Address per hop from the most recent run in range (the current path).
     let latest_run: Option<i64> = sqlx::query(
         "SELECT MAX(id) AS id FROM traceroute_runs
-         WHERE monitor_name = ? AND checked_at >= ? AND checked_at <= ?",
+         WHERE monitor_id = ? AND checked_at >= ? AND checked_at <= ?",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(from_ms)
     .bind(to_ms)
     .fetch_one(pool)
@@ -749,13 +821,13 @@ pub async fn get_traceroute_hops(
 /// timestamps), so the UI brush knows its bounds. None when there is no data.
 pub async fn get_traceroute_extent(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
 ) -> Result<Option<(String, String)>> {
     let row = sqlx::query(
         "SELECT MIN(checked_at) AS lo, MAX(checked_at) AS hi
-         FROM traceroute_runs WHERE monitor_name = ?",
+         FROM traceroute_runs WHERE monitor_id = ?",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .fetch_one(pool)
     .await?;
     let lo: Option<i64> = row.try_get("lo")?;
@@ -772,7 +844,7 @@ pub async fn get_traceroute_extent(
 /// foreign_keys is off), so hops are deleted explicitly.
 pub async fn prune_traceroute(
     pool: &SqlitePool,
-    monitor_name: &str,
+    monitor_id: i64,
     retention_ms: u64,
 ) -> Result<u64> {
     let cutoff_ms = (Utc::now() - chrono::Duration::milliseconds(retention_ms as i64)).timestamp_millis();
@@ -780,17 +852,17 @@ pub async fn prune_traceroute(
 
     sqlx::query(
         "DELETE FROM traceroute_hops WHERE run_id IN
-            (SELECT id FROM traceroute_runs WHERE monitor_name = ? AND checked_at < ?)",
+            (SELECT id FROM traceroute_runs WHERE monitor_id = ? AND checked_at < ?)",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(cutoff_ms)
     .execute(&mut *tx)
     .await?;
 
     let deleted = sqlx::query(
-        "DELETE FROM traceroute_runs WHERE monitor_name = ? AND checked_at < ?",
+        "DELETE FROM traceroute_runs WHERE monitor_id = ? AND checked_at < ?",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .bind(cutoff_ms)
     .execute(&mut *tx)
     .await?
@@ -809,17 +881,17 @@ pub async fn prune_traceroute(
 
 /// Delete all of a monitor's traceroute data (runs, hops) and GC orphan addresses.
 /// Used when a monitor is removed.
-pub async fn delete_traceroute(pool: &SqlitePool, monitor_name: &str) -> Result<()> {
+pub async fn delete_traceroute(pool: &SqlitePool, monitor_id: i64) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "DELETE FROM traceroute_hops WHERE run_id IN
-            (SELECT id FROM traceroute_runs WHERE monitor_name = ?)",
+            (SELECT id FROM traceroute_runs WHERE monitor_id = ?)",
     )
-    .bind(monitor_name)
+    .bind(monitor_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("DELETE FROM traceroute_runs WHERE monitor_name = ?")
-        .bind(monitor_name)
+    sqlx::query("DELETE FROM traceroute_runs WHERE monitor_id = ?")
+        .bind(monitor_id)
         .execute(&mut *tx)
         .await?;
     sqlx::query(
@@ -830,13 +902,4 @@ pub async fn delete_traceroute(pool: &SqlitePool, monitor_name: &str) -> Result<
     .await?;
     tx.commit().await?;
     Ok(())
-}
-
-pub async fn monitor_exists(pool: &SqlitePool, monitor_name: &str) -> Result<bool> {
-    let row = sqlx::query("SELECT COUNT(*) as cnt FROM probe_results WHERE monitor_name = ?")
-        .bind(monitor_name)
-        .fetch_one(pool)
-        .await?;
-    let cnt: i64 = row.try_get("cnt")?;
-    Ok(cnt > 0)
 }

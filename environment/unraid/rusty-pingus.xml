@@ -43,7 +43,7 @@
           Target="/config"
           Default="/mnt/user/appdata/rusty-pingus/config"
           Mode="rw"
-          Description="Directory containing config.toml and monitors.toml. Copy config.toml from the repo as a starting point."
+          Description="Directory containing config.toml. Copy config.toml from the repo as a starting point. Monitors are stored in the database (Data Directory) and managed via the web UI."
           Type="Path"
           Display="always"
           Required="true"

@@ -6,28 +6,30 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::StatusUpdate;
-use crate::monitors::{MonitorConfig, MonitorStore};
+use crate::monitors::{MonitorConfig, MonitorStore, StoredMonitor};
 use crate::db;
 use crate::probe;
 
 pub async fn run(
-    initial_monitors: Vec<MonitorConfig>,
+    initial_monitors: Vec<StoredMonitor>,
     pool: SqlitePool,
     cancel: CancellationToken,
-    mut monitor_rx: watch::Receiver<Vec<MonitorConfig>>,
+    mut monitor_rx: watch::Receiver<Vec<StoredMonitor>>,
     updates: broadcast::Sender<StatusUpdate>,
 ) {
-    // Track per-monitor cancel tokens so we can stop individual tasks.
-    let mut task_tokens: HashMap<String, CancellationToken> = HashMap::new();
+    // Track running tasks by stable id. The stored string is the serialized
+    // config ("version"): comparing it on reload lets us restart only the tasks
+    // whose config actually changed, leaving the rest (and their tickers) alone.
+    let mut task_tokens: HashMap<i64, (CancellationToken, String)> = HashMap::new();
 
     // Spawn initial tasks (disabled monitors are not probed).
     for monitor in &initial_monitors {
-        if !monitor.enabled() {
-            info!(monitor = %monitor.name(), "Monitor disabled; not scheduling");
+        if !monitor.config.enabled() {
+            info!(monitor = %monitor.config.name(), "Monitor disabled; not scheduling");
             continue;
         }
         let token = spawn_monitor(monitor.clone(), pool.clone(), cancel.clone(), updates.clone());
-        task_tokens.insert(monitor.name().to_string(), token);
+        task_tokens.insert(monitor.id, (token, config_key(&monitor.config)));
     }
 
     // Watch for monitor list changes (hot-reload) or global shutdown
@@ -36,7 +38,7 @@ pub async fn run(
             _ = cancel.cancelled() => {
                 info!("Scheduler shutting down");
                 // Cancel all running tasks
-                for token in task_tokens.values() {
+                for (token, _) in task_tokens.values() {
                     token.cancel();
                 }
                 break;
@@ -50,41 +52,57 @@ pub async fn run(
 }
 
 fn diff_and_reload(
-    task_tokens: &mut HashMap<String, CancellationToken>,
-    new_monitors: &[MonitorConfig],
+    task_tokens: &mut HashMap<i64, (CancellationToken, String)>,
+    new_monitors: &[StoredMonitor],
     pool: &SqlitePool,
     global_cancel: &CancellationToken,
     updates: &broadcast::Sender<StatusUpdate>,
 ) {
     // `task_tokens` holds only *running* tasks; the desired set is the enabled
-    // monitors. Reconcile the two so this path also handles enable/disable
-    // toggles (not just add/remove): a monitor that became disabled has its task
-    // cancelled, and one that became enabled gets a task spawned.
-    let old_names: Vec<String> = task_tokens.keys().cloned().collect();
+    // monitors. Reconcile the two so this path handles add/remove, enable/disable
+    // toggles, and edits — all keyed by stable id, so a renamed monitor keeps its
+    // running task (and history) untouched.
+    let old_ids: Vec<i64> = task_tokens.keys().copied().collect();
 
     // Stop tasks for monitors that were removed entirely or are now disabled.
-    for name in &old_names {
-        let still_wanted = new_monitors.iter().any(|m| m.name() == name && m.enabled());
+    for id in &old_ids {
+        let still_wanted = new_monitors.iter().any(|m| m.id == *id && m.config.enabled());
         if !still_wanted {
-            if let Some(token) = task_tokens.remove(name) {
-                info!(monitor = %name, "Stopping monitor (removed or disabled)");
+            if let Some((token, _)) = task_tokens.remove(id) {
+                info!(monitor_id = id, "Stopping monitor (removed or disabled)");
                 token.cancel();
             }
         }
     }
 
-    // Start tasks for enabled monitors that don't have one yet (added or enabled).
+    // Start tasks for enabled monitors that have no task yet, and restart those
+    // whose config changed (e.g. interval/host edited) so the probe picks it up.
     for monitor in new_monitors {
-        if monitor.enabled() && !task_tokens.contains_key(monitor.name()) {
-            info!(monitor = %monitor.name(), "Starting monitor");
-            let token = spawn_monitor(monitor.clone(), pool.clone(), global_cancel.clone(), updates.clone());
-            task_tokens.insert(monitor.name().to_string(), token);
+        if !monitor.config.enabled() {
+            continue;
         }
+        let key = config_key(&monitor.config);
+        match task_tokens.get(&monitor.id) {
+            Some((_, current)) if *current == key => continue, // unchanged; leave running
+            Some((token, _)) => {
+                info!(monitor = %monitor.config.name(), "Restarting monitor (config changed)");
+                token.cancel();
+            }
+            None => info!(monitor = %monitor.config.name(), "Starting monitor"),
+        }
+        let token = spawn_monitor(monitor.clone(), pool.clone(), global_cancel.clone(), updates.clone());
+        task_tokens.insert(monitor.id, (token, key));
     }
 }
 
+/// Serialized config used as a cheap change-detector for hot-reload: if it
+/// differs from the running task's, the task is restarted.
+fn config_key(config: &MonitorConfig) -> String {
+    serde_json::to_string(config).unwrap_or_default()
+}
+
 fn spawn_monitor(
-    monitor: MonitorConfig,
+    monitor: StoredMonitor,
     pool: SqlitePool,
     global_cancel: CancellationToken,
     updates: broadcast::Sender<StatusUpdate>,
@@ -93,15 +111,17 @@ fn spawn_monitor(
     let task_cancel_clone = task_cancel.clone();
 
     tokio::spawn(async move {
-        let name = monitor.name().to_string();
-        let interval_ms = monitor.interval_ms();
+        let id = monitor.id;
+        let config = monitor.config;
+        let name = config.name().to_string();
+        let interval_ms = config.interval_ms();
         let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    match run_probe(&monitor, &pool, &updates).await {
+                    match run_probe(&config, id, &pool, &updates).await {
                         Ok(()) => {}
                         Err(e) => error!(monitor = %name, error = %e, "Probe error"),
                     }
@@ -122,6 +142,7 @@ fn spawn_monitor(
 
 async fn run_probe(
     monitor: &MonitorConfig,
+    monitor_id: i64,
     pool: &SqlitePool,
     updates: &broadcast::Sender<StatusUpdate>,
 ) -> anyhow::Result<()> {
@@ -129,7 +150,7 @@ async fn run_probe(
         MonitorConfig::Http(cfg) => probe::http::run(cfg).await,
         MonitorConfig::Tcp(cfg) => probe::tcp::run(cfg).await,
         MonitorConfig::Icmp(cfg) => probe::icmp::run(cfg).await,
-        MonitorConfig::PublicIp(cfg) => probe::publicip::run(cfg, pool).await,
+        MonitorConfig::PublicIp(cfg) => probe::publicip::run(cfg, pool, monitor_id).await,
         MonitorConfig::Border(cfg) => probe::border::run(cfg).await,
         MonitorConfig::Traceroute(cfg) => {
             // Traceroute yields both a dashboard summary and per-hop data. Persist
@@ -137,19 +158,19 @@ async fn run_probe(
             // below like every other monitor.
             let (summary, run) = probe::traceroute::run(cfg).await;
             if let Some(run) = run {
-                if let Err(e) = db::insert_traceroute(pool, &summary.monitor_name, summary.checked_at, &run).await {
+                if let Err(e) = db::insert_traceroute(pool, monitor_id, &summary.monitor_name, summary.checked_at, &run).await {
                     warn!(monitor = %summary.monitor_name, error = %e, "Failed to persist traceroute run");
                 }
             }
             summary
         }
     };
-    if let Err(e) = db::insert_result(pool, &result).await {
+    if let Err(e) = db::insert_result(pool, monitor_id, &result).await {
         warn!(error = %e, "Failed to persist probe result");
     }
     // Push a live status update to any connected dashboards. Built directly from
     // the ProbeResult (no extra query); a send error just means no subscribers.
-    let _ = updates.send(StatusUpdate::from(&result));
+    let _ = updates.send(StatusUpdate::from_result(monitor_id, &result));
     Ok(())
 }
 
@@ -169,24 +190,25 @@ pub async fn per_monitor_retention_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 for monitor in monitors.list().await {
-                    let name = monitor.name().to_string();
-                    let retention_hours = monitor.retention_hours(global_retention_days);
+                    let id = monitor.id;
+                    let name = monitor.config.name().to_string();
+                    let retention_hours = monitor.config.retention_hours(global_retention_days);
                     let cutoff_ms = (chrono::Utc::now()
                         - chrono::Duration::hours(retention_hours as i64))
                         .timestamp_millis();
                     let cutoff_epoch = cutoff_ms / 1000;
 
-                    match db::prune_monitor_results(&pool, &name, cutoff_ms).await {
+                    match db::prune_monitor_results(&pool, id, cutoff_ms).await {
                         Ok(n) if n > 0 => info!(monitor = %name, deleted = n, retention_hours, "Pruned old probe results"),
                         Ok(_) => {}
                         Err(e) => error!(monitor = %name, error = %e, "Probe result prune failed"),
                     }
-                    if let Err(e) = db::prune_monitor_rollups(&pool, &name, cutoff_epoch).await {
+                    if let Err(e) = db::prune_monitor_rollups(&pool, id, cutoff_epoch).await {
                         error!(monitor = %name, error = %e, "Rollup prune failed");
                     }
-                    if matches!(monitor, MonitorConfig::Traceroute(_)) {
+                    if matches!(monitor.config, MonitorConfig::Traceroute(_)) {
                         let retention_ms = retention_hours.saturating_mul(3_600_000);
-                        match db::prune_traceroute(&pool, &name, retention_ms).await {
+                        match db::prune_traceroute(&pool, id, retention_ms).await {
                             Ok(n) if n > 0 => info!(monitor = %name, deleted = n, "Pruned old traceroute runs"),
                             Ok(_) => {}
                             Err(e) => error!(monitor = %name, error = %e, "Traceroute prune failed"),

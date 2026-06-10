@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
+use sqlx::SqlitePool;
 use tokio::sync::{watch, RwLock};
 
 use crate::config::Defaults;
@@ -526,117 +527,147 @@ struct MonitorsFile {
 
 // ── MonitorStore ──────────────────────────────────────────────────────────────
 
+/// A configured monitor with its stable database id. The id keys all stored
+/// history (so a monitor can be renamed freely); `config` is the pure config.
+#[derive(Clone, Debug, Serialize)]
+pub struct StoredMonitor {
+    pub id: i64,
+    #[serde(flatten)]
+    pub config: MonitorConfig,
+}
+
 #[derive(Clone)]
 pub struct MonitorStore {
-    inner: Arc<RwLock<Vec<MonitorConfig>>>,
-    path: PathBuf,
-    tx: watch::Sender<Vec<MonitorConfig>>,
+    inner: Arc<RwLock<Vec<StoredMonitor>>>,
+    pool: SqlitePool,
+    tx: watch::Sender<Vec<StoredMonitor>>,
 }
 
 impl MonitorStore {
-    /// Load monitors from `path`, applying `defaults` from config.toml.
+    /// Load monitors from the database. On the first run after upgrade (empty
+    /// `monitors` table) a legacy `monitors.toml` at `legacy_path` is imported
+    /// once, then history rows are backfilled with each monitor's stable id.
     /// Returns the store and a watch receiver for hot-reload notifications.
-    pub fn load(
-        path: &Path,
+    pub async fn load(
+        pool: SqlitePool,
+        legacy_path: &Path,
         defaults: &Defaults,
-    ) -> Result<(Self, watch::Receiver<Vec<MonitorConfig>>)> {
-        let (monitors, legacy_found) = load_from_path(path, defaults)?;
+    ) -> Result<(Self, watch::Receiver<Vec<StoredMonitor>>)> {
+        if crate::db::monitors_table_empty(&pool).await? {
+            import_legacy_toml(&pool, legacy_path, defaults).await?;
+        }
 
-        // If the file used the legacy `*_secs` keys, the values were converted to
-        // milliseconds on load; rewrite the file once in the canonical `*_ms` form.
-        if legacy_found {
-            match save_to_path(path, &monitors) {
-                Ok(()) => tracing::warn!(
-                    path = %path.display(),
-                    "Converted legacy *_secs timing fields to milliseconds (×1000) and rewrote the monitors file"
-                ),
-                Err(e) => tracing::error!(error = %e, "Failed to rewrite monitors file after millisecond migration"),
-            }
+        let monitors: Vec<StoredMonitor> = crate::db::list_monitor_rows(&pool)
+            .await?
+            .into_iter()
+            .map(|(id, config)| StoredMonitor { id, config })
+            .collect();
+
+        // One-time, idempotent: tag existing name-keyed history rows with the
+        // monitor's stable id so history survives future renames.
+        for m in &monitors {
+            crate::db::backfill_monitor_id(&pool, m.id, m.config.name()).await?;
         }
 
         let (tx, rx) = watch::channel(monitors.clone());
-        let store = Self {
-            inner: Arc::new(RwLock::new(monitors)),
-            path: path.to_path_buf(),
-            tx,
-        };
+        let store = Self { inner: Arc::new(RwLock::new(monitors)), pool, tx };
         Ok((store, rx))
     }
 
-    pub async fn list(&self) -> Vec<MonitorConfig> {
+    pub async fn list(&self) -> Vec<StoredMonitor> {
         self.inner.read().await.clone()
     }
 
-    pub async fn add(&self, monitor: MonitorConfig) -> Result<()> {
-        let mut monitors = self.inner.write().await;
-        if monitors.iter().any(|m| m.name() == monitor.name()) {
-            anyhow::bail!("a monitor named '{}' already exists", monitor.name());
-        }
-        monitors.push(monitor);
-        self.persist_and_notify(&monitors)?;
-        Ok(())
+    /// The stored monitor with this id, if any.
+    pub async fn get(&self, id: i64) -> Option<StoredMonitor> {
+        self.inner.read().await.iter().find(|m| m.id == id).cloned()
     }
 
-    /// Set a monitor's enabled flag, persisting and notifying watchers (the
-    /// scheduler reacts via hot-reload). Returns `false` if no such monitor.
-    pub async fn set_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
+    /// Add a new monitor, returning its assigned id. Name uniqueness is enforced.
+    pub async fn add(&self, monitor: MonitorConfig) -> Result<i64> {
         let mut monitors = self.inner.write().await;
-        let Some(m) = monitors.iter_mut().find(|m| m.name() == name) else {
+        if monitors.iter().any(|m| m.config.name() == monitor.name()) {
+            anyhow::bail!("a monitor named '{}' already exists", monitor.name());
+        }
+        let id = crate::db::insert_monitor(&self.pool, monitor.name(), &monitor).await?;
+        monitors.push(StoredMonitor { id, config: monitor });
+        self.notify(&monitors);
+        Ok(id)
+    }
+
+    /// Set a monitor's enabled flag by id, persisting and notifying watchers (the
+    /// scheduler reacts via hot-reload). Returns `false` if no such monitor.
+    pub async fn set_enabled(&self, id: i64, enabled: bool) -> Result<bool> {
+        let mut monitors = self.inner.write().await;
+        let Some(m) = monitors.iter_mut().find(|m| m.id == id) else {
             return Ok(false);
         };
-        if m.enabled() == enabled {
-            return Ok(true); // no-op; avoid a needless rewrite/notify
+        if m.config.enabled() == enabled {
+            return Ok(true); // no-op; avoid a needless write/notify
         }
-        m.set_enabled(enabled);
-        self.persist_and_notify(&monitors)?;
+        m.config.set_enabled(enabled);
+        crate::db::update_monitor_row(&self.pool, id, m.config.name(), &m.config).await?;
+        self.notify(&monitors);
+        Ok(true)
+    }
+
+    /// Replace the monitor with `id`, preserving its position. Returns `false` if
+    /// no monitor with that id exists. Persists and notifies watchers.
+    pub async fn update(&self, id: i64, monitor: MonitorConfig) -> Result<bool> {
+        let mut monitors = self.inner.write().await;
+        let Some(slot) = monitors.iter_mut().find(|m| m.id == id) else {
+            return Ok(false);
+        };
+        crate::db::update_monitor_row(&self.pool, id, monitor.name(), &monitor).await?;
+        slot.config = monitor;
+        self.notify(&monitors);
         Ok(true)
     }
 
     /// Returns `true` if found and removed, `false` if not found.
-    pub async fn remove(&self, name: &str) -> Result<bool> {
+    pub async fn remove(&self, id: i64) -> Result<bool> {
         let mut monitors = self.inner.write().await;
         let before = monitors.len();
-        monitors.retain(|m| m.name() != name);
+        monitors.retain(|m| m.id != id);
         if monitors.len() == before {
             return Ok(false);
         }
-        self.persist_and_notify(&monitors)?;
+        crate::db::delete_monitor_row(&self.pool, id).await?;
+        self.notify(&monitors);
         Ok(true)
     }
 
-    fn persist_and_notify(&self, monitors: &[MonitorConfig]) -> Result<()> {
-        save_to_path(&self.path, monitors)?;
+    fn notify(&self, monitors: &[StoredMonitor]) {
         let _ = self.tx.send(monitors.to_vec());
-        Ok(())
     }
 }
 
-/// Returns the loaded monitors and whether the file used legacy `*_secs` keys
-/// (which were converted to milliseconds), signalling that a rewrite is due.
-fn load_from_path(path: &Path, defaults: &Defaults) -> Result<(Vec<MonitorConfig>, bool)> {
+/// One-time import of a legacy `monitors.toml` into the `monitors` table, applying
+/// `[defaults]`. No-op when the file is absent or empty. Legacy `*_secs` timing
+/// keys are converted to milliseconds during deserialization.
+async fn import_legacy_toml(pool: &SqlitePool, path: &Path, defaults: &Defaults) -> Result<()> {
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(path, DEFAULT_MONITORS_CONFIG)
-            .with_context(|| format!("Could not write default monitors config to: {}", path.display()))?;
-        tracing::warn!(
-            path = %path.display(),
-            "No monitors.toml found — generated a default. Add monitors via the web UI or edit the file."
-        );
-        return Ok((vec![], false));
+        return Ok(());
     }
-
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Could not read monitors file: {}", path.display()))?;
     let file: MonitorsFile = toml::from_str(&contents)
         .with_context(|| format!("Invalid TOML in monitors file: {}", path.display()))?;
 
-    let legacy_found = contents.contains("interval_secs") || contents.contains("timeout_secs");
-
     let mut monitors = file.monitors;
+    if monitors.is_empty() {
+        return Ok(());
+    }
     apply_defaults(&mut monitors, defaults);
-    Ok((monitors, legacy_found))
+    for m in &monitors {
+        crate::db::insert_monitor(pool, m.name(), m).await?;
+    }
+    tracing::warn!(
+        count = monitors.len(),
+        path = %path.display(),
+        "Imported monitors from monitors.toml into the database; the file is no longer the source of truth."
+    );
+    Ok(())
 }
 
 fn save_to_path(path: &Path, monitors: &[MonitorConfig]) -> Result<()> {
@@ -876,5 +907,75 @@ mod tests {
             "[[monitors]]\nprotocol = \"traceroute\"\nname = \"t\"\nhost = \"1.1.1.1\"\nqueries_per_hop = 0\n",
         );
         assert_eq!(c.queries_per_hop, 1);
+    }
+
+    fn tcp(name: &str, host: &str, port: u16) -> MonitorConfig {
+        MonitorConfig::Tcp(TcpMonitorConfig {
+            name: name.into(), host: host.into(), port,
+            interval_ms: 60_000, timeout_ms: 10_000, retention_hours: None, enabled: true,
+        })
+    }
+
+    async fn temp_store() -> (MonitorStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let pool = crate::db::init(db_path.to_str().unwrap()).await.expect("db init");
+        let legacy = dir.path().join("monitors.toml"); // absent → empty store
+        let (store, _rx) = MonitorStore::load(pool, &legacy, &Defaults::default()).await.expect("load");
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn update_replaces_in_place_and_allows_rename() {
+        let (store, _dir) = temp_store().await;
+
+        let id = store.add(tcp("db", "a", 5432)).await.expect("add");
+        let _ = store.add(tcp("web", "b", 80)).await.expect("add");
+
+        // Edit by id: change host/port AND rename — the id and position are kept.
+        assert!(store.update(id, tcp("database", "c", 6543)).await.expect("update"));
+
+        let list = store.list().await;
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, id, "id + position preserved");
+        match &list[0].config {
+            MonitorConfig::Tcp(c) => {
+                assert_eq!(c.name, "database", "rename applied");
+                assert_eq!(c.port, 6543);
+            }
+            other => panic!("expected tcp, got {other:?}"),
+        }
+
+        // Unknown id → Ok(false), nothing changed.
+        assert!(!store.update(99_999, tcp("nope", "x", 1)).await.expect("update missing"));
+        assert_eq!(store.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn imports_legacy_toml_once_and_backfills_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.db");
+        let pool = crate::db::init(db_path.to_str().unwrap()).await.expect("db init");
+
+        // A pre-migration, name-keyed probe row (monitor_id still null).
+        sqlx::query("INSERT INTO probe_results (monitor_name, status, checked_at) VALUES ('legacy', 'up', 1000)")
+            .execute(&pool).await.expect("seed");
+
+        let legacy = dir.path().join("monitors.toml");
+        std::fs::write(&legacy, "[[monitors]]\nprotocol = \"tcp\"\nname = \"legacy\"\nhost = \"h\"\nport = 1\n").unwrap();
+
+        let (store, _rx) = MonitorStore::load(pool.clone(), &legacy, &Defaults::default()).await.expect("load");
+        let list = store.list().await;
+        assert_eq!(list.len(), 1, "legacy monitor imported");
+        let id = list[0].id;
+
+        // The pre-existing history row was tagged with the new stable id.
+        let tagged: i64 = sqlx::query_scalar("SELECT monitor_id FROM probe_results WHERE monitor_name = 'legacy'")
+            .fetch_one(&pool).await.expect("query");
+        assert_eq!(tagged, id, "history backfilled to the monitor's id");
+
+        // A second load must not re-import (table is no longer empty).
+        let (store2, _rx2) = MonitorStore::load(pool, &legacy, &Defaults::default()).await.expect("reload");
+        assert_eq!(store2.list().await.len(), 1, "import is one-time");
     }
 }

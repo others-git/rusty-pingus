@@ -11,7 +11,7 @@ use super::ProbeResult;
 /// Query an external IP-echo service and record the host's public IP. Up when a
 /// service responds with a parseable address (stored in `detail`, with a change
 /// note when it differs from the last recorded value); down otherwise.
-pub async fn run(cfg: &PublicIpMonitorConfig, pool: &SqlitePool) -> ProbeResult {
+pub async fn run(cfg: &PublicIpMonitorConfig, pool: &SqlitePool, monitor_id: i64) -> ProbeResult {
     let endpoint = cfg
         .url
         .clone()
@@ -48,7 +48,7 @@ pub async fn run(cfg: &PublicIpMonitorConfig, pool: &SqlitePool) -> ProbeResult 
                         Some(ip) => {
                             let elapsed = start.elapsed().as_millis() as u64;
                             let ip_str = ip.to_string();
-                            let prev = prior_ip(pool, &cfg.name).await;
+                            let prev = prior_ip(pool, monitor_id).await;
                             let detail = detail_for_ip(&ip_str, prev.as_deref());
                             debug!(monitor = %cfg.name, ip = %ip_str, service = %url, "Public-IP probe up");
                             return ProbeResult::up(&cfg.name, "publicip", &endpoint, elapsed)
@@ -88,8 +88,8 @@ fn detail_for_ip(new_ip: &str, prev_ip: Option<&str>) -> String {
 
 /// The most recently recorded IP for this monitor: the leading token of the prior
 /// probe's detail (which may also carry a "(changed from …)" suffix).
-async fn prior_ip(pool: &SqlitePool, name: &str) -> Option<String> {
-    let latest = db::get_latest_status(pool, name).await.ok().flatten()?;
+async fn prior_ip(pool: &SqlitePool, monitor_id: i64) -> Option<String> {
+    let latest = db::get_latest_status(pool, monitor_id).await.ok().flatten()?;
     let detail = latest.detail?;
     detail.split_whitespace().next().map(|s| s.to_string())
 }

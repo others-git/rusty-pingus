@@ -41,11 +41,11 @@ async fn tcp_probe_up_stored_in_db() {
     assert_eq!(result.status, "up", "expected probe to succeed against local listener");
     assert!(result.response_time_ms.is_some());
 
-    db::insert_result(&pool, &result).await.expect("insert_result");
+    db::insert_result(&pool, 1, &result).await.expect("insert_result");
 
     let statuses = db::get_current_status(&pool).await.expect("get_current_status");
     assert_eq!(statuses.len(), 1);
-    assert_eq!(statuses[0].monitor_name, "test-tcp");
+    assert_eq!(statuses[0].monitor_id, 1);
     assert_eq!(statuses[0].status, "up");
 }
 
@@ -77,7 +77,7 @@ async fn tcp_probe_down_stored_in_db() {
     assert_eq!(result.status, "down");
     assert!(result.failure_reason.is_some());
 
-    db::insert_result(&pool, &result).await.expect("insert_result");
+    db::insert_result(&pool, 1, &result).await.expect("insert_result");
 
     let statuses = db::get_current_status(&pool).await.expect("get_current_status");
     assert_eq!(statuses.len(), 1);
@@ -95,10 +95,10 @@ async fn detail_round_trips_through_insert_and_history() {
     let mut without = probe::ProbeResult::up("ip-mon", "publicip", "https://checkip.amazonaws.com", 9);
     without.checked_at = chrono::Utc::now() - chrono::Duration::seconds(60);
     with.checked_at = chrono::Utc::now();
-    db::insert_result(&pool, &without).await.expect("insert without");
-    db::insert_result(&pool, &with).await.expect("insert with");
+    db::insert_result(&pool, 1, &without).await.expect("insert without");
+    db::insert_result(&pool, 1, &with).await.expect("insert with");
 
-    let history = db::get_history(&pool, "ip-mon", None, None, 10)
+    let history = db::get_history(&pool, 1, None, None, 10)
         .await
         .expect("get_history");
     assert_eq!(history.len(), 2);
@@ -107,7 +107,7 @@ async fn detail_round_trips_through_insert_and_history() {
     assert_eq!(history[1].detail, None);
 
     // Current status also carries the latest detail.
-    let latest = db::get_latest_status(&pool, "ip-mon")
+    let latest = db::get_latest_status(&pool, 1)
         .await
         .expect("get_latest_status")
         .expect("a row");
@@ -131,10 +131,10 @@ async fn uptime_calculation_correct() {
             checked_at: chrono::Utc::now()
                 - chrono::Duration::seconds((3 - i as i64) * 10),
         };
-        db::insert_result(&pool, &r).await.expect("insert");
+        db::insert_result(&pool, 1, &r).await.expect("insert");
     }
 
-    let uptime = db::get_uptime(&pool, "uptime-test", 3600)
+    let uptime = db::get_uptime(&pool, 1, 3600)
         .await
         .expect("get_uptime");
 
@@ -158,10 +158,10 @@ async fn history_query_returns_ordered_results() {
             detail: None,
             checked_at: chrono::Utc::now() - chrono::Duration::seconds(i * 60),
         };
-        db::insert_result(&pool, &r).await.expect("insert");
+        db::insert_result(&pool, 1, &r).await.expect("insert");
     }
 
-    let history = db::get_history(&pool, "hist-test", None, None, 10)
+    let history = db::get_history(&pool, 1, None, None, 10)
         .await
         .expect("get_history");
 
@@ -190,11 +190,11 @@ async fn series_buckets_are_bounded_and_aggregated() {
             detail: None,
             checked_at: now - chrono::Duration::minutes((19 - i) * 3),
         };
-        db::insert_result(&pool, &r).await.expect("insert");
+        db::insert_result(&pool, 1, &r).await.expect("insert");
     }
 
     let from = now - chrono::Duration::hours(1) - chrono::Duration::minutes(5);
-    let buckets = db::get_series(&pool, "series-test", from, now, 5)
+    let buckets = db::get_series(&pool, 1, from, now, 5)
         .await
         .expect("get_series");
 
@@ -212,7 +212,7 @@ async fn series_buckets_are_bounded_and_aggregated() {
     // A range with no results returns an empty series.
     let empty = db::get_series(
         &pool,
-        "series-test",
+        1,
         now - chrono::Duration::days(40),
         now - chrono::Duration::days(39),
         5,
@@ -243,7 +243,7 @@ async fn rollups_back_series_and_uptime() {
                 detail: None,
                 checked_at: base + chrono::Duration::seconds(i as i64), // same minute
             };
-            db::insert_result(&pool, &r).await.expect("insert");
+            db::insert_result(&pool, 1, &r).await.expect("insert");
         }
     }
 
@@ -257,7 +257,7 @@ async fn rollups_back_series_and_uptime() {
     // get_series over a wide span (span/buckets >= 60) → served from the rollup.
     let series = db::get_series(
         &pool,
-        "roll",
+        1,
         now - chrono::Duration::minutes(90),
         now,
         5,
@@ -274,11 +274,11 @@ async fn rollups_back_series_and_uptime() {
     }
 
     // get_uptime over a 30d window (>24h) → served from the rollup.
-    let uptime = db::get_uptime(&pool, "roll", 2_592_000).await.expect("uptime").unwrap();
+    let uptime = db::get_uptime(&pool, 1, 2_592_000).await.expect("uptime").unwrap();
     assert!((uptime - (10.0 / 15.0) * 100.0).abs() < 0.01, "expected 66.67%, got {uptime}");
 
     // delete_results also clears rollups.
-    db::delete_results(&pool, "roll").await.expect("delete");
+    db::delete_results(&pool, 1).await.expect("delete");
     assert!(db::rollup_watermark(&pool).await.expect("watermark").is_none());
 }
 

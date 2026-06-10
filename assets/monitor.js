@@ -46,7 +46,8 @@ function monitorDetail() {
   let detailBrushTimer = null;
 
   return {
-    monitorName: decodeURIComponent(location.pathname.replace(/^\/monitors\//, '')),
+    monitorId: Number(location.pathname.replace(/^\/monitors\//, '')),
+    monitorName: '',   // display name, fetched on init (history is keyed by id)
     currentStatus: null,
     loading: true,
     activeWindow: '24h',
@@ -87,22 +88,28 @@ function monitorDetail() {
     borderEndpoint: '',      // "ip1 → ip2 → ip3"; populated from config on load, real IPs via SSE
 
     async init() {
-      document.title = `${this.monitorName} — Rusty Pingus`;
-      const name = encodeURIComponent(this.monitorName);
+      const id = this.monitorId;
 
-      const [histRes, uptimeRes] = await Promise.all([
-        fetch(`/api/monitors/${name}/history?limit=100`),
-        fetch(`/api/monitors/${name}/uptime`),
+      // Fetch the monitor's identity (name/protocol/endpoint) by id alongside its
+      // history and uptime. The meta call is the not-found gate and the source of
+      // the display name + protocol (so even an unprobed monitor renders).
+      const [metaRes, histRes, uptimeRes] = await Promise.all([
+        fetch(`/api/monitors/${id}`),
+        fetch(`/api/monitors/${id}/history?limit=100`),
+        fetch(`/api/monitors/${id}/uptime`),
       ]);
-      if (!histRes.ok) { this.currentStatus = 'not_found'; this.loading = false; return; }
+      if (!metaRes.ok) { this.currentStatus = 'not_found'; this.loading = false; return; }
+      const meta = await metaRes.json();
+      this.monitorName = meta.name;
+      document.title = `${this.monitorName} — Rusty Pingus`;
 
-      const history = await histRes.json();
+      const history = histRes.ok ? await histRes.json() : [];
       const uptime = uptimeRes.ok ? await uptimeRes.json() : {};
       for (const w of this.uptimeWindows) w.value = uptime[w.key] ?? null;
       this.uptime24h = uptime.uptime_24h ?? null;
 
       const latest = history[0]; // history is newest-first
-      this.currentStatus = latest ? latest.status : 'pending';
+      this.currentStatus = latest ? latest.status : (meta.status || 'pending');
       this.lastResponseMs = latest ? latest.response_time_ms : null;
       this.lastCheckedAt = latest ? latest.checked_at : null;
       this.detail = latest ? latest.detail : null;
@@ -110,10 +117,10 @@ function monitorDetail() {
       // Anchor windows to the newest server-recorded probe time (falls back to
       // the browser clock only while there is no data).
       if (latest) this._bumpServerNow(latest.checked_at);
-      const proto = latest ? latest.protocol : null;
+      const proto = meta.protocol;
       this.timelineKind = (proto === 'publicip' || proto === 'border') ? proto : '';
       this.isTraceroute = proto === 'traceroute';
-      if (this.timelineKind === 'border') this.borderEndpoint = (latest && latest.endpoint) || '';
+      if (this.timelineKind === 'border') this.borderEndpoint = meta.endpoint || '';
 
       this.loading = false;
       if (this.isTraceroute) {
@@ -139,7 +146,7 @@ function monitorDetail() {
         onOpen: () => this._stopPoll(),            // stream live → poll not needed
         onError: () => this._startPoll(),          // browser reconnects; poll covers the gap
         onUpdate: (u) => {
-          if (u.name !== this.monitorName) return; // ignore other monitors
+          if (u.id !== this.monitorId) return; // ignore other monitors
           this._onLiveUpdate(u);
         },
       });
@@ -227,11 +234,11 @@ function monitorDetail() {
     },
     async _pollOnce() {
       try {
-        const name = encodeURIComponent(this.monitorName);
-        const rows = await (await fetch(`/api/monitors/${name}/history?limit=1`)).json();
+        const id = this.monitorId;
+        const rows = await (await fetch(`/api/monitors/${id}/history?limit=1`)).json();
         const latest = Array.isArray(rows) ? rows[0] : null;
         if (latest) this._onLiveUpdate({
-          name: this.monitorName,
+          id: this.monitorId,
           status: latest.status,
           response_time_ms: latest.response_time_ms,
           last_checked_at: latest.checked_at,
@@ -258,7 +265,7 @@ function monitorDetail() {
 
     // Fetch data at a resolution matched to the range, then render.
     async loadRange(fromMs, toMs, resetView = false) {
-      const name = encodeURIComponent(this.monitorName);
+      const id = this.monitorId;
       const to = Math.min(toMs, this._anchorMs()); // clamp to server data time, not browser clock
       const from = Math.min(fromMs, to - 1000);
       const fromIso = new Date(from).toISOString();
@@ -270,7 +277,7 @@ function monitorDetail() {
         // Public-IP and border monitors render a state timeline via the server-
         // collapsed segments endpoint (no row-count cap, spans the full window).
         if (this.timelineKind) {
-          const segUrl = `/api/monitors/${name}/segments?from=${encodeURIComponent(fromIso)}`
+          const segUrl = `/api/monitors/${id}/segments?from=${encodeURIComponent(fromIso)}`
             + `&to=${encodeURIComponent(toIso)}`;
           const serverSegs = await (await fetch(segUrl)).json().catch(() => []);
           if (seq !== refetchSeq) return;
@@ -292,7 +299,7 @@ function monitorDetail() {
         }
 
         // Series first: it counts the whole range (uncapped), unlike /history.
-        const serUrl = `/api/monitors/${name}/series?from=${encodeURIComponent(fromIso)}`
+        const serUrl = `/api/monitors/${id}/series?from=${encodeURIComponent(fromIso)}`
           + `&to=${encodeURIComponent(toIso)}&buckets=${BUCKET_TARGET}`;
         const series = await (await fetch(serUrl)).json().catch(() => []);
         if (seq !== refetchSeq) return;
@@ -302,7 +309,7 @@ function monitorDetail() {
 
         let downFlags;
         if (total > 0 && total <= RAW_LIMIT) {
-          const histUrl = `/api/monitors/${name}/history?from=${encodeURIComponent(fromIso)}`
+          const histUrl = `/api/monitors/${id}/history?from=${encodeURIComponent(fromIso)}`
             + `&to=${encodeURIComponent(toIso)}&limit=${RAW_LIMIT}`;
           const rows = await (await fetch(histUrl)).json().catch(() => []);
           if (seq !== refetchSeq) return;
@@ -616,9 +623,9 @@ function monitorDetail() {
 
     // ── Detail-page extent + brush (non-traceroute monitors) ─────────────────
     async _loadExtent() {
-      const name = encodeURIComponent(this.monitorName);
+      const id = this.monitorId;
       try {
-        const ext = await (await fetch(`/api/monitors/${name}/extent`)).json();
+        const ext = await (await fetch(`/api/monitors/${id}/extent`)).json();
         this.retentionHours = ext.retention_hours ?? null;
         this.detailExtentFrom = (ext.from && ext.from !== ext.to) ? Date.parse(ext.from) : null;
         this.detailExtentTo = ext.to ? Date.parse(ext.to) : null;
@@ -741,9 +748,9 @@ function monitorDetail() {
     },
 
     async _loadTraceExtent() {
-      const name = encodeURIComponent(this.monitorName);
+      const id = this.monitorId;
       try {
-        const ext = await (await fetch(`/api/monitors/${name}/traceroute/extent`)).json();
+        const ext = await (await fetch(`/api/monitors/${id}/traceroute/extent`)).json();
         this.traceExtentFrom = ext.from ? Date.parse(ext.from) : null;
         this.traceExtentTo = ext.to ? Date.parse(ext.to) : null;
       } catch (e) { /* no data yet; bounds stay null */ }
@@ -753,13 +760,13 @@ function monitorDetail() {
     // compute the bar-scaling maximum (the slowest hop avg in view).
     async _loadTraceHops() {
       if (this.traceFrom == null || this.traceTo == null) return;
-      const name = encodeURIComponent(this.monitorName);
+      const id = this.monitorId;
       const fromIso = new Date(this.traceFrom).toISOString();
       const toIso = new Date(this.traceTo).toISOString();
       this.traceLoading = true;
       try {
         const hops = await (await fetch(
-          `/api/monitors/${name}/traceroute?from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`
+          `/api/monitors/${id}/traceroute?from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`
         )).json();
         this.traceHops = Array.isArray(hops) ? hops : [];
         this.hasData = this.traceHops.length > 0;

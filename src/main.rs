@@ -119,15 +119,18 @@ async fn async_main(
 ) -> Result<()> {
     let monitors_path = std::path::Path::new(&cfg.monitors.path);
 
-    // ── Load monitors ─────────────────────────────────────────────────────────
-    let (monitor_store, monitor_rx) = monitors::MonitorStore::load(monitors_path, &cfg.defaults)?;
-    let initial_monitors = monitor_store.list().await;
-
+    // Open the database first: monitors now live in it (a legacy monitors.toml is
+    // imported once on first run), so the store loads from the pool.
     let pool = db::init(&cfg.database.path).await?;
+
+    // ── Load monitors ─────────────────────────────────────────────────────────
+    let (monitor_store, monitor_rx) =
+        monitors::MonitorStore::load(pool.clone(), monitors_path, &cfg.defaults).await?;
+    let initial_monitors = monitor_store.list().await;
 
     info!("Starting rusty-pingus with {} monitors", initial_monitors.len());
 
-    let has_icmp = initial_monitors.iter().any(|m| matches!(m, monitors::MonitorConfig::Icmp(_)));
+    let has_icmp = initial_monitors.iter().any(|m| matches!(m.config, monitors::MonitorConfig::Icmp(_)));
     if has_icmp && !probe::icmp::check_privilege() {
         tracing::warn!("ICMP monitors configured but CAP_NET_RAW may be unavailable.");
     }

@@ -26,7 +26,7 @@
   <link rel="stylesheet" href="/themes.css" />
   <script defer src="/theme.js"></script>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased" x-data="dashboard()" @keydown.escape.window="showAddModal = false; pendingDelete = null">
+<body class="bg-slate-950 text-slate-100 min-h-screen font-sans antialiased" x-data="dashboard()" @keydown.escape.window="closeModal(); pendingDelete = null">
 
   <!-- Sticky Header -->
   <header class="sticky top-0 z-10 bg-slate-900 border-b border-slate-700 shadow-lg">
@@ -44,7 +44,7 @@
         </span>
         <span class="text-slate-500 text-xs" x-text="lastUpdated ? 'Updated ' + lastUpdated : ''" x-show="lastUpdated"></span>
         <!-- Add Monitor button -->
-        <button @click="showAddModal = true"
+        <button @click="openAdd()"
                 class="flex items-center gap-2 px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold rounded-lg transition-colors">
           <i class="fa-solid fa-plus"></i> Add Monitor
         </button>
@@ -62,7 +62,7 @@
     <div x-show="!loading && monitors.length === 0" class="text-center py-24 text-slate-500">
       <i class="fa-solid fa-satellite-dish text-4xl mb-4 block text-slate-700"></i>
       No monitors yet.
-      <button @click="showAddModal = true" class="text-cyan-400 hover:text-cyan-300 underline ml-1">Add your first monitor</button>
+      <button @click="openAdd()" class="text-cyan-400 hover:text-cyan-300 underline ml-1">Add your first monitor</button>
     </div>
 
     <!-- Monitor grid -->
@@ -72,7 +72,7 @@
          x-transition:enter-end="opacity-100 translate-y-0"
          class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
 
-      <template x-for="m in monitors" :key="m.name">
+      <template x-for="m in monitors" :key="m.id">
         <div class="group relative bg-slate-800 border border-slate-700 rounded-xl p-5 shadow-md hover:border-cyan-500 hover:shadow-cyan-950 transition-all duration-200"
              :class="{
                'border-l-4 border-l-slate-600': !m.enabled,
@@ -84,7 +84,7 @@
 
           <!-- Whole-tile link (stretched overlay). Interactive controls below sit
                above it (z-10) so they stay clickable without navigating. -->
-          <a :href="'/monitors/' + encodeURIComponent(m.name)"
+          <a :href="'/monitors/' + m.id"
              :aria-label="'View ' + m.name"
              class="absolute inset-0 z-0 rounded-xl"></a>
 
@@ -150,12 +150,17 @@
 
           <!-- Controls (hover-revealed), bottom-right, above the tile link -->
           <div class="absolute bottom-3 right-3 z-10 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button @click.stop="openEdit(m)"
+                    class="text-slate-500 hover:text-cyan-400 p-1 rounded"
+                    title="Edit monitor">
+              <i class="fa-solid fa-pen text-xs"></i>
+            </button>
             <button @click.stop="toggleMonitor(m)"
                     class="text-slate-500 hover:text-cyan-400 p-1 rounded"
                     :title="m.enabled ? 'Pause monitor' : 'Resume monitor'">
               <i class="fa-solid text-xs" :class="m.enabled ? 'fa-pause' : 'fa-play'"></i>
             </button>
-            <button @click.stop="pendingDelete = m.name"
+            <button @click.stop="pendingDelete = m"
                     class="text-slate-500 hover:text-red-400 p-1 rounded"
                     title="Delete monitor">
               <i class="fa-solid fa-trash text-xs"></i>
@@ -171,14 +176,14 @@
     <div class="bg-slate-800 border border-slate-700 rounded-xl p-6 shadow-2xl max-w-sm w-full mx-4">
       <h3 class="text-base font-semibold text-slate-100 mb-2">Delete monitor?</h3>
       <p class="text-sm text-slate-400 mb-5">
-        <span class="text-slate-200 font-medium" x-text="pendingDelete"></span> will be permanently removed.
+        <span class="text-slate-200 font-medium" x-text="pendingDelete?.name"></span> will be permanently removed.
       </p>
       <div class="flex gap-3 justify-end">
         <button @click="pendingDelete = null"
                 class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 transition-colors">
           Cancel
         </button>
-        <button @click="deleteMonitor(pendingDelete)"
+        <button @click="deleteMonitor(pendingDelete.id)"
                 class="px-4 py-2 text-sm bg-red-600 hover:bg-red-500 text-white rounded-lg font-medium transition-colors">
           Delete
         </button>
@@ -188,18 +193,18 @@
 
   <!-- ── Add Monitor modal ───────────────────────────────────────────────── -->
   <div x-cloak x-show="showAddModal" x-transition class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-       @click.self="showAddModal = false">
+       @click.self="closeModal()">
     <div class="bg-slate-800 border border-slate-700 rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
       <div class="flex items-center justify-between px-6 py-4 border-b border-slate-700">
-        <h2 class="text-base font-semibold text-slate-100">Add Monitor</h2>
-        <button @click="showAddModal = false" class="text-slate-400 hover:text-slate-200 transition-colors">
+        <h2 class="text-base font-semibold text-slate-100" x-text="editingId ? 'Edit Monitor' : 'Add Monitor'">Add Monitor</h2>
+        <button @click="closeModal()" class="text-slate-400 hover:text-slate-200 transition-colors">
           <i class="fa-solid fa-xmark"></i>
         </button>
       </div>
 
       <div class="p-6">
-        <!-- Protocol tabs -->
-        <div class="flex gap-1 mb-5 bg-slate-900 rounded-lg p-1">
+        <!-- Protocol tabs (adding only — an existing monitor's protocol is fixed) -->
+        <div x-show="!editingId" class="flex gap-1 mb-5 bg-slate-900 rounded-lg p-1">
           <template x-for="proto in ['http', 'tcp', 'icmp', 'publicip', 'border', 'traceroute']" :key="proto">
             <button @click="form.protocol = proto; formErrors = {}"
                     class="flex-1 py-1.5 text-xs font-semibold rounded-md transition-colors"
@@ -210,10 +215,14 @@
             </button>
           </template>
         </div>
+        <!-- Protocol label (editing) -->
+        <div x-show="editingId" class="mb-5 text-xs text-slate-400">
+          Protocol: <span class="text-slate-200 font-medium" x-text="protocolLabel(form.protocol)"></span>
+        </div>
 
         <form @submit.prevent="submitMonitor()" class="flex flex-col gap-4">
 
-          <!-- Name (all protocols) -->
+          <!-- Name (all protocols; freely editable — history is keyed by id) -->
           <div>
             <label class="block text-xs font-medium text-slate-400 mb-1">Monitor Name</label>
             <input x-model="form.name" type="text" placeholder="my-api"
@@ -360,14 +369,14 @@
           <p x-show="formErrors._general" x-text="formErrors._general" class="text-red-400 text-xs"></p>
 
           <div class="flex gap-3 justify-end pt-2">
-            <button type="button" @click="showAddModal = false"
+            <button type="button" @click="closeModal()"
                     class="px-4 py-2 text-sm text-slate-400 hover:text-slate-200 transition-colors">
               Cancel
             </button>
             <button type="submit" :disabled="submitting"
                     class="px-5 py-2 text-sm bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white rounded-lg font-medium transition-colors flex items-center gap-2">
               <i x-show="submitting" class="fa-solid fa-circle-notch fa-spin"></i>
-              <span x-text="submitting ? 'Adding…' : 'Add Monitor'"></span>
+              <span x-text="submitting ? (editingId ? 'Saving…' : 'Adding…') : (editingId ? 'Save Changes' : 'Add Monitor')"></span>
             </button>
           </div>
         </form>

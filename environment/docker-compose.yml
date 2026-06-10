@@ -3,7 +3,9 @@
 # Or from this directory:   docker compose up
 #
 # Before starting, create a config/ directory next to this file and copy
-# config.toml + monitors.toml from the repo root into it.
+# config.toml from the repo root into it. Monitors are stored in the database
+# (under ./data) and managed via the web UI/API — no monitors file is needed.
+# (A legacy monitors.toml placed in ./config is imported once on first run.)
 
 services:
   rusty-pingus:
@@ -16,7 +18,7 @@ services:
     ports:
       - "${BIND_PORT:-8080}:${BIND_PORT:-8080}"
     volumes:
-      # Place config.toml and monitors.toml inside ./config/ before starting.
+      # Place config.toml inside ./config/ before starting (monitors live in the DB).
       - ./config:/config
       - ./data:/data
     environment:

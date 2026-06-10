@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{header, HeaderMap, Response, StatusCode, Uri},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{get, post},
     Router,
 };
 use rust_embed::{Embed, EmbeddedFile};
@@ -89,24 +89,24 @@ async fn serve_monitor_page(headers: HeaderMap) -> impl IntoResponse {
 pub async fn serve(bind: String, state: AppState, cancel: CancellationToken) {
     let app = Router::new()
         .route("/", get(serve_index))
-        .route("/monitors/:name", get(serve_monitor_page))
+        .route("/monitors/:id", get(serve_monitor_page))
         // Probe status API (read-only, derived from probe_results)
         .route("/api/monitors", get(api::list_monitors))
         // Live status stream (SSE) — must precede the `/*path` asset catch-all
         .route("/api/monitors/stream", get(api::monitor_stream))
-        .route("/api/monitors/:name/history", get(api::monitor_history))
-        .route("/api/monitors/:name/uptime", get(api::monitor_uptime))
-        .route("/api/monitors/:name/series", get(api::monitor_series))
-        .route("/api/monitors/:name/segments", get(api::monitor_segments))
-        .route("/api/monitors/:name/extent", get(api::monitor_extent))
-        // Traceroute per-hop data + retained extent (more specific route first)
-        .route("/api/monitors/:name/traceroute/extent", get(api::monitor_traceroute_extent))
-        .route("/api/monitors/:name/traceroute", get(api::monitor_traceroute))
-        // Monitor config CRUD
+        // Monitor config CRUD (the literal `/config` route must precede `/:id`)
         .route("/api/monitors/config", get(api::list_monitor_configs))
+        .route("/api/monitors/:id/history", get(api::monitor_history))
+        .route("/api/monitors/:id/uptime", get(api::monitor_uptime))
+        .route("/api/monitors/:id/series", get(api::monitor_series))
+        .route("/api/monitors/:id/segments", get(api::monitor_segments))
+        .route("/api/monitors/:id/extent", get(api::monitor_extent))
+        // Traceroute per-hop data + retained extent (more specific route first)
+        .route("/api/monitors/:id/traceroute/extent", get(api::monitor_traceroute_extent))
+        .route("/api/monitors/:id/traceroute", get(api::monitor_traceroute))
         .route("/api/monitors", post(api::add_monitor))
-        .route("/api/monitors/:name/enabled", post(api::set_monitor_enabled))
-        .route("/api/monitors/:name", delete(api::delete_monitor))
+        .route("/api/monitors/:id/enabled", post(api::set_monitor_enabled))
+        .route("/api/monitors/:id", get(api::get_monitor).put(api::update_monitor).delete(api::delete_monitor))
         // Static assets catch-all
         .route("/*path", get(serve_asset))
         .with_state(state);

@@ -24,14 +24,9 @@ cp target/release/rusty-pingus /usr/local/bin/
 
 ## Configuration
 
-Configuration is split into two files:
+App settings live in **`config.toml`** (bind address, database path, defaults, retention). **Monitors are stored in the database** and managed entirely through the web UI or the JSON API — there is no monitors file to edit. Each monitor has a stable integer **id** (so it can be renamed freely without losing its history). `config.toml` is auto-generated with commented examples on first run.
 
-| File | Purpose |
-|---|---|
-| `config.toml` | App settings: bind address, database path, defaults, log retention |
-| `monitors.toml` | Monitor definitions: managed by the web UI or edited directly |
-
-Both files are auto-generated with commented examples on first run.
+> **Upgrading from a `monitors.toml`-based version?** On first start, any existing `monitors.toml` is imported into the database once and is no longer used afterward (it can be deleted). Existing probe history is preserved and re-keyed to the new monitor ids automatically.
 
 ### Timing units (milliseconds)
 
@@ -41,11 +36,11 @@ Older files that use the legacy `interval_secs` / `timeout_secs` keys are still 
 
 ### Migration from single config.toml
 
-If you have an existing `config.toml` with `[[monitors]]` entries (from v0.0.1), rusty-pingus will automatically migrate them to `monitors.toml` on startup and remove the entries from `config.toml`.
+If you have an existing `config.toml` with `[[monitors]]` entries (from v0.0.1), or a `monitors.toml` file, rusty-pingus imports those monitors into the database once on startup. After that, the database is the source of truth and the files are no longer read.
 
 ### config.toml
 
-App-wide settings only — monitors live in `monitors.toml` (see below). See `config.toml` in this repo for a commented example:
+App-wide settings only — monitors live in the database. See `config.toml` in this repo for a commented example:
 
 ```toml
 [defaults]
@@ -59,13 +54,16 @@ bind = "0.0.0.0:3000"
 [database]
 path = "./data/rusty-pingus.db"
 
+# Optional: path to a legacy monitors.toml to import once on first run.
 [monitors]
 path = "./monitors.toml"
 ```
 
-### monitors.toml
+### Monitors
 
-Monitor definitions are an array of `[[monitors]]` tables, each tagged by `protocol`. This file is managed by the web UI (additions/removals are written back automatically), or you can edit it directly. Every monitor accepts two optional fields: `enabled = false` pauses it (kept in config and history, but not probed), and `retention_hours` overrides how long its data is kept (default: the global `retention_days × 24`).
+Monitors are stored in the database and managed through the web UI (Add Monitor / edit / pause / delete) or the JSON API (see below). Each monitor is one of six `protocol` types (`http`, `tcp`, `icmp`, `publicip`, `border`, `traceroute`). Every monitor also accepts two optional fields: `enabled` (set false to pause without deleting — kept with its history but not probed) and `retention_hours` (overrides how long its data is kept; default the global `retention_days × 24`). A monitor's **name is just a label and can be changed at any time** — its history is keyed by the stable id, not the name.
+
+The per-type fields are the same whether you add a monitor in the UI or via `POST /api/monitors` — they're listed below (shown in TOML for readability):
 
 ```toml
 # HTTP monitor
@@ -129,7 +127,7 @@ retention_hours = 24           # optional (default 24 h)
 | `[defaults].retention_days` | integer | 90 | Delete results older than N days. Defaults to 90 when unset (probe history is pruned automatically so the database doesn't grow without bound — important at low poll intervals). Set a larger value to keep more history. |
 | `[web].bind` | string | `0.0.0.0:3000` | Web server bind address |
 | `[database].path` | string | `./data/rusty-pingus.db` | SQLite file path |
-| `[monitors].path` | string | `./monitors.toml` | Path to the monitor definitions file |
+| `[monitors].path` | string | `./monitors.toml` | Legacy monitors file to import once on first run (ignored thereafter) |
 
 Every monitor type also accepts two optional fields: `enabled` (boolean, default `true`; set `false` to pause without deleting) and `retention_hours` (integer; overrides the global retention for that monitor's data).
 
@@ -191,7 +189,7 @@ The traceroute monitor (`protocol = "traceroute"`) records the full per-hop path
 RUST_LOG=debug ./rusty-pingus
 ```
 
-The `--monitors` flag overrides the monitors file path from `config.toml`. Monitors added or removed via the web UI are written back to this file automatically.
+The `--monitors` flag overrides the path of the legacy monitors file imported on first run. Monitors are otherwise stored in the database and managed via the web UI or API.
 
 ## Windows
 
@@ -208,7 +206,7 @@ Double-click `rusty-pingus.exe` from Explorer or your Downloads folder. A cyan i
 Release builds write logs to `<data_dir>/logs/rusty-pingus.YYYY-MM-DD.log` (default: `./data/logs/`). For debug output, run from a terminal using a debug build (`cargo run`).
 
 ### First run / missing config
-On first run, rusty-pingus generates default `config.toml` and `monitors.toml` files and starts with zero monitors. Add monitors via the web UI, or edit `monitors.toml` directly.
+On first run, rusty-pingus generates a default `config.toml` and starts with zero monitors. Add monitors via the web UI (they're stored in the database).
 
 ## ICMP Privileges
 
@@ -226,22 +224,26 @@ TCP and HTTP probes work without elevated privileges.
 
 ## API
 
-- `GET /api/monitors` — current status of all monitors
-- `GET /api/monitors/stream` — Server-Sent Events stream of live status updates (one event per probe completion: name, status, response time, failure reason, last-checked time). The dashboard subscribes to this for near-real-time updates and falls back to polling `/api/monitors` if it's unavailable.
-- `GET /api/monitors/:name/history?from=<iso8601>&to=<iso8601>&limit=100` — raw probe history
-- `GET /api/monitors/:name/uptime` — uptime % for 1h, 24h, 7d, 30d windows
-- `GET /api/monitors/:name/series?from=<iso8601>&to=<iso8601>&buckets=300` — response time aggregated into a bounded number of time buckets (each: bucket start, avg/min/max ms, sample count, up-ratio). Used by the monitor detail chart so any window stays fast regardless of poll interval. `buckets` is clamped to 50–1000; defaults are the last 24h with ~300 buckets.
-- `GET /api/monitors/:name/segments?from=<iso8601>&to=<iso8601>` — contiguous up/down segments over the window, for drawing downtime bands.
-- `GET /api/monitors/:name/extent` — the earliest and latest retained timestamps for the monitor (the bounds available to chart/history queries).
-- `GET /api/monitors/:name/traceroute?from=<iso8601>&to=<iso8601>` — per-hop traceroute data (traceroute monitors only).
-- `GET /api/monitors/:name/traceroute/extent` — the retained time range of traceroute data for the monitor.
+Monitors are addressed by their stable integer **id** (`:id`), so renaming a monitor never breaks links or history.
 
-**Monitor management** (these mutate `monitors.toml`):
+- `GET /api/monitors` — current status of all monitors (each includes its `id` and `name`)
+- `GET /api/monitors/stream` — Server-Sent Events stream of live status updates (one event per probe completion: id, name, status, response time, failure reason, last-checked time). The dashboard subscribes to this for near-real-time updates and falls back to polling `/api/monitors` if it's unavailable.
+- `GET /api/monitors/:id` — current status of a single monitor (id, name, protocol, endpoint, latest result)
+- `GET /api/monitors/:id/history?from=<iso8601>&to=<iso8601>&limit=100` — raw probe history
+- `GET /api/monitors/:id/uptime` — uptime % for 1h, 24h, 7d, 30d windows
+- `GET /api/monitors/:id/series?from=<iso8601>&to=<iso8601>&buckets=300` — response time aggregated into a bounded number of time buckets (each: bucket start, avg/min/max ms, sample count, up-ratio). Used by the monitor detail chart so any window stays fast regardless of poll interval. `buckets` is clamped to 50–1000; defaults are the last 24h with ~300 buckets.
+- `GET /api/monitors/:id/segments?from=<iso8601>&to=<iso8601>` — contiguous up/down segments over the window, for drawing downtime bands.
+- `GET /api/monitors/:id/extent` — the earliest and latest retained timestamps for the monitor (the bounds available to chart/history queries).
+- `GET /api/monitors/:id/traceroute?from=<iso8601>&to=<iso8601>` — per-hop traceroute data (traceroute monitors only).
+- `GET /api/monitors/:id/traceroute/extent` — the retained time range of traceroute data for the monitor.
 
-- `GET /api/monitors/config` — full monitor definitions (the parsed `monitors.toml`).
-- `POST /api/monitors` — add a monitor.
-- `POST /api/monitors/:name/enabled` — enable/disable a monitor (pauses probing without deleting it).
-- `DELETE /api/monitors/:name` — remove a monitor.
+**Monitor management** (these mutate the database):
+
+- `GET /api/monitors/config` — full monitor definitions (each with its `id`).
+- `POST /api/monitors` — add a monitor (returns the updated list; the new monitor has an assigned `id`).
+- `PUT /api/monitors/:id` — replace a monitor's configuration (including renaming it).
+- `POST /api/monitors/:id/enabled` — enable/disable a monitor (pauses probing without deleting it).
+- `DELETE /api/monitors/:id` — remove a monitor.
 
 Wide chart windows and long uptime windows (7d/30d) are served from **per-minute rollups** (a background task aggregates `probe_results` into a `probe_rollup_1m` table), so their cost scales with minutes rather than the raw row count — important at low poll intervals. Fine/recent ranges still read raw results, and queries fall back to raw until the rollup has backfilled.
 
