@@ -1,6 +1,6 @@
 [package]
 name = "rusty-pingus"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [dependencies]
@@ -30,6 +30,7 @@ webbrowser = "0.8"
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.14"
 windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging"] }
+png = "0.17"
 
 [dev-dependencies]
 tokio-test = "0.4"

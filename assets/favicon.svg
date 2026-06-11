@@ -1,7 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <!-- Rusty Pingus: a rust-colored penguin with a live "up" pulse across the belly.
-       Source of truth for favicon.ico / icon.png / apple-touch-icon.png
-       (regenerate with rsvg-convert; see environment/unraid + index.html). -->
+       Source of truth for favicon.ico / icon.png / apple-touch-icon.png /
+       tray-icon.png (regenerate with rsvg-convert; see environment/unraid,
+       index.html, and src/tray). -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#1d2b47"/>

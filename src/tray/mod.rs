@@ -10,27 +10,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
-/// Generate a 32×32 cyan circle as raw RGBA — no PNG file needed.
+/// Decode the embedded app icon (a 32×32 PNG rendered from assets/favicon.svg)
+/// into the raw RGBA the tray API wants, so the tray matches the favicon and
+/// the Unraid icon without shipping a separate file.
 fn make_icon() -> tray_icon::Icon {
-    let size = 32u32;
-    let cx = 15.5f32;
-    let cy = 15.5f32;
-    let r2 = 14.0f32 * 14.0f32;
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - cx;
-            let dy = y as f32 - cy;
-            let i = ((y * size + x) * 4) as usize;
-            if dx * dx + dy * dy <= r2 {
-                rgba[i] = 34;    // #22d3ee cyan
-                rgba[i + 1] = 211;
-                rgba[i + 2] = 238;
-                rgba[i + 3] = 255;
-            }
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, size, size).expect("build tray icon")
+    static ICON_PNG: &[u8] = include_bytes!("../../assets/tray-icon.png");
+    let mut decoder = png::Decoder::new(ICON_PNG);
+    // Normalize to 8-bit RGBA regardless of how the encoder wrote the PNG.
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = decoder.read_info().expect("read tray icon png");
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("decode tray icon png");
+    buf.truncate(info.buffer_size());
+    tray_icon::Icon::from_rgba(buf, info.width, info.height).expect("build tray icon")
 }
 
 /// Re-launch this executable with the same command-line arguments, then signal

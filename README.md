@@ -203,7 +203,7 @@ The `--monitors` flag overrides the path of the legacy monitors file imported on
 ## Windows
 
 ### System tray
-Double-click `rusty-pingus.exe` from Explorer or your Downloads folder. A cyan icon appears in the system tray (notification area, bottom-right). No console window opens.
+Double-click `rusty-pingus.exe` from Explorer or your Downloads folder. The rusty-pingus penguin icon appears in the system tray (notification area, bottom-right). No console window opens.
 
 - **Left-click** the tray icon → opens the dashboard in your default browser
 - **Right-click** → "Open Dashboard", "Reload Config", or "Quit"
