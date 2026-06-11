@@ -1,28 +1,95 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <!-- Rusty Pingus: a rust-colored penguin with an "up" pulse across the belly.
+  <!-- Rusty Pingus: a rust-colored penguin with a live "up" pulse across the belly.
        Source of truth for favicon.ico / icon.png / apple-touch-icon.png
        (regenerate with rsvg-convert; see environment/unraid + index.html). -->
-  <rect width="512" height="512" rx="100" fill="#0f172a"/>
-  <!-- flippers -->
-  <ellipse cx="122" cy="310" rx="26" ry="86" fill="#7c2d12" transform="rotate(20 122 310)"/>
-  <ellipse cx="390" cy="310" rx="26" ry="86" fill="#7c2d12" transform="rotate(-20 390 310)"/>
-  <!-- feet -->
-  <ellipse cx="212" cy="452" rx="36" ry="15" fill="#f59e0b"/>
-  <ellipse cx="300" cy="452" rx="36" ry="15" fill="#f59e0b"/>
-  <!-- head + body -->
-  <circle cx="256" cy="168" r="88" fill="#b7410e"/>
-  <ellipse cx="256" cy="312" rx="124" ry="138" fill="#b7410e"/>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2b47"/>
+      <stop offset="1" stop-color="#0a101f"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d4561b"/>
+      <stop offset="0.55" stop-color="#b7410e"/>
+      <stop offset="1" stop-color="#8c3109"/>
+    </linearGradient>
+    <linearGradient id="flip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9a3a0d"/>
+      <stop offset="1" stop-color="#6f2708"/>
+    </linearGradient>
+    <linearGradient id="belly" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff8ec"/>
+      <stop offset="1" stop-color="#f7dcb6"/>
+    </linearGradient>
+    <linearGradient id="beak" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#d97706"/>
+    </linearGradient>
+    <clipPath id="bodyClip">
+      <path d="M256 86
+               C 318 86 356 130 360 184
+               C 396 250 402 330 390 380
+               C 372 446 322 458 256 458
+               C 190 458 140 446 122 380
+               C 110 330 116 250 152 184
+               C 156 130 194 86 256 86 Z"/>
+    </clipPath>
+  </defs>
+
+  <rect width="512" height="512" rx="100" fill="url(#bg)"/>
+  <rect x="3" y="3" width="506" height="506" rx="97" fill="none"
+        stroke="#ffffff" stroke-opacity="0.06" stroke-width="6"/>
+
+  <!-- flippers (drawn first; the body overlaps the attachment) -->
+  <path id="flipL" d="M158 222 C 102 258 80 342 102 398 C 110 418 132 416 141 396
+                      C 160 352 166 296 172 250 Z" fill="url(#flip)"/>
+  <use href="#flipL" transform="matrix(-1 0 0 1 512 0)"/>
+
+  <!-- feet (under the belly, peeking out) -->
+  <ellipse cx="206" cy="460" rx="40" ry="17" fill="url(#beak)"/>
+  <ellipse cx="306" cy="460" rx="40" ry="17" fill="url(#beak)"/>
+
+  <!-- body: one smooth head-to-belly silhouette -->
+  <path d="M256 86
+           C 318 86 356 130 360 184
+           C 396 250 402 330 390 380
+           C 372 446 322 458 256 458
+           C 190 458 140 446 122 380
+           C 110 330 116 250 152 184
+           C 156 130 194 86 256 86 Z" fill="url(#body)"/>
+
   <!-- belly -->
-  <ellipse cx="256" cy="330" rx="84" ry="104" fill="#ffedd5"/>
+  <path d="M256 202
+           C 302 202 332 246 336 304
+           C 340 364 322 432 256 436
+           C 190 432 172 364 176 304
+           C 180 246 210 202 256 202 Z" fill="url(#belly)"/>
+
+  <!-- head sheen (clipped to the body silhouette) -->
+  <g clip-path="url(#bodyClip)">
+    <ellipse cx="212" cy="118" rx="72" ry="38" fill="#ffffff" opacity="0.09"
+             transform="rotate(-18 212 118)"/>
+  </g>
+
   <!-- eyes -->
-  <circle cx="224" cy="152" r="20" fill="#ffffff"/>
-  <circle cx="288" cy="152" r="20" fill="#ffffff"/>
-  <circle cx="229" cy="156" r="9" fill="#2a1205"/>
-  <circle cx="283" cy="156" r="9" fill="#2a1205"/>
+  <circle cx="223" cy="150" r="25" fill="#ffffff"/>
+  <circle cx="289" cy="150" r="25" fill="#ffffff"/>
+  <circle cx="228" cy="155" r="11.5" fill="#23120a"/>
+  <circle cx="284" cy="155" r="11.5" fill="#23120a"/>
+  <circle cx="232.5" cy="150.5" r="4" fill="#ffffff"/>
+  <circle cx="288.5" cy="150.5" r="4" fill="#ffffff"/>
+
   <!-- beak -->
-  <polygon points="234,184 278,184 256,212" fill="#f59e0b"/>
-  <!-- pulse line ("up" green) -->
-  <polyline points="186,330 226,330 242,296 262,366 278,316 290,330 326,330"
-            fill="none" stroke="#22c55e" stroke-width="13"
-            stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M228 178 C 244 171 268 171 284 178
+           C 277 200 265 209 256 209
+           C 247 209 235 200 228 178 Z" fill="url(#beak)"/>
+
+  <!-- pulse line ("up" green) with soft glow and live dot -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="186,332 224,332 240,298 260,368 276,318 288,332 318,332"
+              stroke="#22c55e" stroke-opacity="0.28" stroke-width="26"/>
+    <polyline points="186,332 224,332 240,298 260,368 276,318 288,332 318,332"
+              stroke="#22c55e" stroke-width="13"/>
+  </g>
+  <circle cx="318" cy="332" r="15" fill="#22c55e" opacity="0.25"/>
+  <circle cx="318" cy="332" r="8" fill="#22c55e"/>
 </svg>
