@@ -608,6 +608,88 @@ pub async fn get_state_segments(
     Ok(segs)
 }
 
+/// Per-hop reachability segments for a border monitor: one collapsed up/down
+/// timeline per path position (local gateway, ISP gateway, upstream). State is
+/// "up"/"down", or null when that hop wasn't measured (e.g. the ISP gateway
+/// before detection, or rows with no per-hop detail).
+#[derive(Debug, Serialize)]
+pub struct BorderHopSegments {
+    pub local: Vec<StateSegment>,
+    pub isp: Vec<StateSegment>,
+    pub upstream: Vec<StateSegment>,
+}
+
+/// Parse a border probe's per-hop reachability out of its detail string.
+/// Details end with an RTT group like `(local 2ms, isp —, upstream 15ms)`:
+/// an RTT means the hop answered, `—` means it didn't, and a missing key means
+/// it wasn't measured. Returns `[local, isp, upstream]`.
+fn parse_border_hop_states(detail: Option<&str>) -> [Option<bool>; 3] {
+    let mut states = [None, None, None];
+    let Some(detail) = detail else { return states };
+    let Some(open) = detail.rfind('(') else { return states };
+    let inner = detail[open + 1..].trim_end().trim_end_matches(')');
+    for part in inner.split(',') {
+        let mut toks = part.split_whitespace();
+        let (Some(key), Some(val)) = (toks.next(), toks.next()) else { continue };
+        let idx = match key {
+            "local" => 0,
+            "isp" => 1,
+            "upstream" => 2,
+            _ => continue,
+        };
+        states[idx] = Some(val != "—");
+    }
+    states
+}
+
+/// Collapsed per-hop up/down segments for a border monitor over `[from_ms, to_ms]`.
+/// Same streaming fold as [`get_state_segments`], but tracking the three path
+/// positions independently so each IP's uptime can be charted on its own row.
+pub async fn get_border_hop_segments(
+    pool: &SqlitePool,
+    monitor_id: i64,
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<BorderHopSegments> {
+    let mut rows = sqlx::query(
+        "SELECT detail, checked_at FROM probe_results
+         WHERE monitor_id = ? AND checked_at >= ? AND checked_at <= ?
+         ORDER BY checked_at ASC",
+    )
+    .bind(monitor_id)
+    .bind(from_ms)
+    .bind(to_ms)
+    .fetch(pool);
+
+    let mut hops: [Vec<StateSegment>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    while let Some(row) = rows.try_next().await? {
+        let detail: Option<String> = row.try_get("detail")?;
+        let t: i64 = row.try_get("checked_at")?;
+        let states = parse_border_hop_states(detail.as_deref());
+        for (segs, hop) in hops.iter_mut().zip(states) {
+            let state = hop.map(|up| if up { "up" } else { "down" }.to_string());
+            match segs.last_mut() {
+                Some(last) if last.state == state => {
+                    last.end_ms = t;
+                }
+                _ => {
+                    if let Some(last) = segs.last_mut() {
+                        last.end_ms = t;
+                    }
+                    segs.push(StateSegment { state, start_ms: t, end_ms: t });
+                }
+            }
+        }
+    }
+    for segs in hops.iter_mut() {
+        if let Some(last) = segs.last_mut() {
+            last.end_ms = to_ms;
+        }
+    }
+    let [local, isp, upstream] = hops;
+    Ok(BorderHopSegments { local, isp, upstream })
+}
+
 /// Delete all stored probe results (and rollups) for a monitor. Returns the
 /// number of raw rows removed.
 pub async fn delete_results(pool: &SqlitePool, monitor_id: i64) -> Result<u64> {
@@ -898,4 +980,47 @@ pub async fn delete_traceroute(pool: &SqlitePool, monitor_id: i64) -> Result<()>
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_border_hop_states;
+
+    #[test]
+    fn border_states_all_up() {
+        assert_eq!(
+            parse_border_hop_states(Some("ok (local 2ms, isp 8ms, upstream 15ms)")),
+            [Some(true), Some(true), Some(true)]
+        );
+    }
+
+    #[test]
+    fn border_states_mixed_and_down() {
+        assert_eq!(
+            parse_border_hop_states(Some("ok (local —, isp 8ms, upstream 15ms)")),
+            [Some(false), Some(true), Some(true)]
+        );
+        assert_eq!(
+            parse_border_hop_states(Some("lan_down — local gateway unreachable (local —, isp —, upstream —)")),
+            [Some(false), Some(false), Some(false)]
+        );
+    }
+
+    #[test]
+    fn border_states_isp_not_measured() {
+        assert_eq!(
+            parse_border_hop_states(Some("ok (local 2ms, upstream 15ms)")),
+            [Some(true), None, Some(true)]
+        );
+    }
+
+    #[test]
+    fn border_states_no_rtt_group() {
+        // gateway_not_detected / privilege_error rows carry no per-hop data.
+        assert_eq!(
+            parse_border_hop_states(Some("local gateway could not be detected — check network")),
+            [None, None, None]
+        );
+        assert_eq!(parse_border_hop_states(None), [None, None, None]);
+    }
 }

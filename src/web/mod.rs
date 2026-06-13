@@ -100,6 +100,8 @@ pub async fn serve(bind: String, state: AppState, cancel: CancellationToken) {
         .route("/api/monitors/:id/uptime", get(api::monitor_uptime))
         .route("/api/monitors/:id/series", get(api::monitor_series))
         .route("/api/monitors/:id/segments", get(api::monitor_segments))
+        // Border per-hop segments + resolved path (Network Path panel + chart)
+        .route("/api/monitors/:id/border/segments", get(api::monitor_border_segments))
         .route("/api/monitors/:id/extent", get(api::monitor_extent))
         // Traceroute per-hop data + retained extent (more specific route first)
         .route("/api/monitors/:id/traceroute/extent", get(api::monitor_traceroute_extent))

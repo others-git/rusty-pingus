@@ -244,10 +244,18 @@
                       'text-red-300':     hop.status === 'down',
                       'text-slate-400':   hop.status === 'unknown',
                     }"
-                    x-text="hop.ip === 'auto' ? 'detecting…' : hop.ip"></span>
+                    x-text="hop.ip || 'detecting…'"></span>
               <span class="text-xs mt-0.5"
                     :class="hop.rtt != null ? 'text-slate-400' : 'text-slate-600'"
                     x-text="hop.rtt != null ? hop.rtt + ' ms' : '—'"></span>
+              <span class="text-[10px] font-semibold"
+                    :class="{
+                      'text-emerald-400': hop.uptime != null && hop.uptime >= 99,
+                      'text-amber-400':   hop.uptime != null && hop.uptime >= 90 && hop.uptime < 99,
+                      'text-red-400':     hop.uptime != null && hop.uptime < 90,
+                      'text-slate-600':   hop.uptime == null,
+                    }"
+                    x-text="hop.uptime != null ? hop.uptime.toFixed(1) + '% up' : '— % up'"></span>
             </div>
             <i x-show="i < borderHops().length - 1"
                class="fa-solid fa-arrow-right text-slate-600 shrink-0"></i>
@@ -311,7 +319,7 @@
     <section x-show="!isTraceroute" class="bg-slate-900 border border-slate-700 rounded-xl p-6">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xs font-semibold uppercase tracking-widest text-slate-400 flex items-center gap-2">
-          <span x-text="timelineKind === 'publicip' ? 'Public IP' : (timelineKind === 'border' ? 'Border Status' : 'Response Time')"></span>
+          <span x-text="timelineKind === 'publicip' ? 'Public IP' : (timelineKind === 'border' ? 'Network Path Uptime' : 'Response Time')"></span>
           <span x-show="!timelineKind && chartMode === 'raw'" class="text-cyan-500/70 normal-case tracking-normal">(raw)</span>
           <i class="fa-solid fa-circle-notch text-slate-600 transition-opacity duration-150"
              :class="isLoadingDetail ? 'fa-spin opacity-100' : 'opacity-0'"></i>
@@ -337,7 +345,7 @@
           <div class="flex items-center gap-2">
             <span class="inline-block w-3 h-3 rounded-sm" :style="`background:${entry.color}`"></span>
             <span class="text-slate-300" :class="timelineKind === 'publicip' ? 'font-mono' : ''" x-text="entry.label"></span>
-            <span class="text-slate-500" x-text="'· ' + fmtLegendDuration(entry.ms)"></span>
+            <span class="text-slate-500" x-show="entry.ms != null" x-text="'· ' + fmtLegendDuration(entry.ms)"></span>
           </div>
         </template>
       </div>

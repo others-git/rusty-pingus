@@ -402,6 +402,43 @@ pub async fn monitor_segments(
     }
 }
 
+/// `GET /api/monitors/:id/border/segments?from&to` — a border monitor's per-hop
+/// up/down segments (local gateway, ISP gateway, upstream) plus the currently
+/// resolved path IPs, for the per-hop uptime chart and the Network Path panel.
+pub async fn monitor_border_segments(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(params): Query<SegmentsParams>,
+) -> impl IntoResponse {
+    let Some(m) = state.monitors.get(id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "monitor_not_found", "id": id })),
+        ).into_response();
+    };
+    let MonitorConfig::Border(ref cfg) = m.config else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "not_a_border_monitor", "id": id })),
+        ).into_response();
+    };
+    let (local_ip, isp_ip, upstream_ip) = crate::probe::border::resolved_path(cfg).await;
+    let to = params.to.unwrap_or_else(Utc::now);
+    let from = params.from.unwrap_or_else(|| to - chrono::Duration::hours(24));
+    match db::get_border_hop_segments(&state.pool, id, from.timestamp_millis(), to.timestamp_millis()).await {
+        Ok(segs) => Json(serde_json::json!({
+            "path": { "local": local_ip, "isp": isp_ip, "upstream": upstream_ip },
+            "local": segs.local,
+            "isp": segs.isp,
+            "upstream": segs.upstream,
+        })).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "DB error in monitor_border_segments");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "db_error"}))).into_response()
+        }
+    }
+}
+
 /// `GET /api/monitors/:name/extent` — earliest/latest probe times and the
 /// monitor's effective retention (hours), so the detail-page brush knows its
 /// bounds. Works for all monitor types (use traceroute/extent for traceroute).

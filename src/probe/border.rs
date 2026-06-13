@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::monitors::BorderMonitorConfig;
@@ -14,8 +14,9 @@ use super::ProbeResult;
 const TRACE_TARGET: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
 /// Stop the discovery walk after this many hops. Home networks reach the ISP in
 /// 2–3 hops, but a virtualized egress (WSL2/Docker bridge) plus double-NAT/CGNAT
-/// can add a few private hops before the first public one, so allow some headroom.
-const TRACE_MAX_HOPS: u8 = 8;
+/// can add private hops, and ISP edge routers often drop TTL-exceeded for several
+/// hops before a public router finally answers — so allow generous headroom.
+const TRACE_MAX_HOPS: u8 = 12;
 /// Per-hop read timeout for the discovery walk — kept short because we are
 /// probing local hops and want startup to be fast (≤ 1 s total worst case).
 const WALK_PER_HOP_MS: u64 = 200;
@@ -26,7 +27,6 @@ const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_DEST_UNREACHABLE: u8 = 3;
 
 /// Gateways discovered via a traceroute walk to a public endpoint.
-/// Cached for the process lifetime — topology rarely changes while running.
 #[derive(Debug)]
 struct DetectedGateways {
     /// Last RFC-1918/CGNAT hop before traffic exits to the public internet — the
@@ -38,7 +38,20 @@ struct DetectedGateways {
     isp_gw: Option<String>,
 }
 
-static DETECTED_GWS: OnceCell<Option<DetectedGateways>> = OnceCell::const_new();
+/// Cached detection result. A *complete* detection (both gateways found) is
+/// trusted for the process lifetime — topology rarely changes while running. An
+/// incomplete one (no public hop seen, or nothing at all) is retried after
+/// [`REDETECT_AFTER`]: a router that was slow or dropping packets at startup
+/// must not blank the path until restart.
+struct GwCache {
+    detected: Option<DetectedGateways>,
+    attempted_at: Instant,
+}
+
+static GW_CACHE: Mutex<Option<GwCache>> = Mutex::const_new(None);
+
+/// How long an incomplete detection is trusted before the walk is retried.
+const REDETECT_AFTER: Duration = Duration::from_secs(300);
 
 /// Localize connectivity faults by probing both the local (egress) gateway and
 /// the ISP gateway, then an upstream reference:
@@ -49,7 +62,8 @@ static DETECTED_GWS: OnceCell<Option<DetectedGateways>> = OnceCell::const_new();
 /// - local gw up, ISP gw up (or not detected), upstream down → `isp_down`
 ///
 /// Gateways are auto-detected via a traceroute walk when not configured
-/// explicitly, and the result is cached for the process lifetime.
+/// explicitly; a complete detection is cached for the process lifetime, an
+/// incomplete one is retried periodically.
 pub async fn run(cfg: &BorderMonitorConfig) -> ProbeResult {
     let timeout = Duration::from_millis(cfg.timeout_ms);
     let (local_gw, isp_gw) = resolve_gateways(cfg).await;
@@ -144,23 +158,38 @@ async fn resolve_gateways(cfg: &BorderMonitorConfig) -> (Option<String>, Option<
         return (Some(gw.clone()), cfg.isp_gateway.clone());
     }
 
-    // Auto-detect via traceroute walk, cached for the process lifetime.
+    // Auto-detect via traceroute walk. A complete detection is reused for the
+    // process lifetime; an incomplete one is re-walked after REDETECT_AFTER.
     // Uses WALK_PER_HOP_MS (not the probe timeout) so detection is fast.
-    let detected = DETECTED_GWS
-        .get_or_init(|| async {
-            tokio::task::spawn_blocking(|| {
-                walk_for_gateways(Duration::from_millis(WALK_PER_HOP_MS))
-            })
-            .await
-            .ok()
-            .flatten()
+    let mut cache = GW_CACHE.lock().await;
+    let complete = cache.as_ref().is_some_and(|c| {
+        c.detected.as_ref().is_some_and(|d| d.isp_gw.is_some())
+    });
+    let fresh = cache.as_ref().is_some_and(|c| c.attempted_at.elapsed() < REDETECT_AFTER);
+    if !complete && !fresh {
+        let walked = tokio::task::spawn_blocking(|| {
+            walk_for_gateways(Duration::from_millis(WALK_PER_HOP_MS))
         })
-        .await;
+        .await
+        .ok()
+        .flatten();
+        let prior = cache.take().and_then(|c| c.detected);
+        // Merge with what was known: a re-walk that transiently sees fewer hops
+        // must not erase a previously detected one.
+        let detected = match (prior, walked) {
+            (Some(old), Some(new)) => Some(DetectedGateways {
+                local_gw: new.local_gw,
+                isp_gw: new.isp_gw.or(old.isp_gw),
+            }),
+            (old, new) => new.or(old),
+        };
+        *cache = Some(GwCache { detected, attempted_at: Instant::now() });
+    }
+    let detected = cache.as_ref().and_then(|c| c.detected.as_ref());
 
     // Local GW = the traceroute's last private hop (the actual LAN edge). Fall back
     // to the routing-table default gateway only when the walk found nothing.
     let local_gw = detected
-        .as_ref()
         .map(|d| d.local_gw.clone())
         .or_else(detect_default_gateway);
 
@@ -168,9 +197,30 @@ async fn resolve_gateways(cfg: &BorderMonitorConfig) -> (Option<String>, Option<
     let isp_gw = cfg
         .isp_gateway
         .clone()
-        .or_else(|| detected.as_ref().and_then(|d| d.isp_gw.clone()));
+        .or_else(|| detected.and_then(|d| d.isp_gw.clone()));
 
     (local_gw, isp_gw)
+}
+
+/// The monitor's currently resolved path — `(local_gw, isp_gw, upstream)` — for
+/// display (the Network Path panel). Read-only: explicit config wins, then
+/// whatever detection has cached so far, then the routing table; it never
+/// triggers a walk (the probe loop owns detection).
+pub async fn resolved_path(cfg: &BorderMonitorConfig) -> (Option<String>, Option<String>, String) {
+    // Mirrors resolve_gateways: an explicit local gateway disables detection.
+    if let Some(ref gw) = cfg.gateway {
+        return (Some(gw.clone()), cfg.isp_gateway.clone(), cfg.upstream.clone());
+    }
+    let cache = GW_CACHE.lock().await;
+    let detected = cache.as_ref().and_then(|c| c.detected.as_ref());
+    let local = detected
+        .map(|d| d.local_gw.clone())
+        .or_else(detect_default_gateway);
+    let isp = cfg
+        .isp_gateway
+        .clone()
+        .or_else(|| detected.and_then(|d| d.isp_gw.clone()));
+    (local, isp, cfg.upstream.clone())
 }
 
 /// Pure classification of a border cycle — network-free, for testing.
@@ -232,14 +282,21 @@ fn classify_border(
 /// gateway). Returns `None` when no hop can be probed or no private-IP hop is
 /// seen (host already on a public address).
 ///
-/// Prefers an **unprivileged DGRAM ICMP socket** on Linux — the same socket
-/// family the echo probes use — so detection works wherever `ping` does, without
-/// `CAP_NET_RAW`. Falls back to a RAW socket (needs privilege) on other platforms
-/// or if the DGRAM walk yields nothing.
+/// On Linux, tries fully unprivileged walks first: a **UDP socket** with
+/// `IP_RECVERR` (the `tracepath` technique — also the only one that traverses
+/// the WSL2/Docker NAT, which rewrites ICMP echo ids and breaks the ICMP
+/// error-queue match), then a **DGRAM ICMP socket** (works wherever `ping`
+/// does). Falls back to a RAW socket (needs privilege) on other platforms or
+/// when both unprivileged walks yield nothing.
 fn walk_for_gateways(per_hop: Duration) -> Option<DetectedGateways> {
     #[cfg(target_os = "linux")]
-    if let Some(gws) = walk_dgram_linux(per_hop) {
-        return Some(gws);
+    {
+        if let Some(gws) = walk_udp_linux(per_hop) {
+            return Some(gws);
+        }
+        if let Some(gws) = walk_dgram_linux(per_hop) {
+            return Some(gws);
+        }
     }
     walk_raw(per_hop)
 }
@@ -256,6 +313,9 @@ where
 
     for ttl in 1..=TRACE_MAX_HOPS {
         if let Some(ip) = probe(ttl) {
+            if ip == TRACE_TARGET {
+                break; // reached the trace destination — no more routers ahead
+            }
             if is_private_ipv4(ip) {
                 last_private = Some(ip);
             } else if first_public.is_none() {
@@ -315,6 +375,66 @@ fn walk_raw(per_hop: Duration) -> Option<DetectedGateways> {
     })
 }
 
+/// Enable `IP_RECVERR` so ICMP errors (Time-Exceeded from intermediate routers)
+/// are queued on the socket's error queue instead of being dropped.
+#[cfg(target_os = "linux")]
+fn enable_ip_recverr(fd: libc::c_int) -> bool {
+    let on: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_RECVERR,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    rc == 0
+}
+
+/// Wait (up to the per-hop budget) for an error-queue event, then read the
+/// offending router's address. `POLLERR` is reported in `revents` regardless
+/// of `events`.
+#[cfg(target_os = "linux")]
+fn poll_errqueue_offender(fd: libc::c_int, per_hop_ms: libc::c_int) -> Option<Ipv4Addr> {
+    let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
+    let pr = unsafe { libc::poll(&mut pfd, 1, per_hop_ms) };
+    if pr <= 0 {
+        return None; // no response within the budget
+    }
+    recv_errqueue_offender(fd)
+}
+
+/// Unprivileged UDP walk (Linux only) — the `tracepath` technique: send UDP
+/// datagrams to high traceroute ports with increasing TTL and read each
+/// Time-Exceeded off the error queue. Needs no privileges at all, and is the
+/// only walk that traverses the WSL2/Docker NAT (which rewrites ICMP echo ids,
+/// breaking the kernel's error-to-socket match for ICMP-based walks).
+#[cfg(target_os = "linux")]
+fn walk_udp_linux(per_hop: Duration) -> Option<DetectedGateways> {
+    use std::os::fd::AsRawFd;
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    let fd = socket.as_raw_fd();
+    if !enable_ip_recverr(fd) {
+        return None;
+    }
+
+    let per_hop_ms = per_hop.as_millis().min(i32::MAX as u128) as libc::c_int;
+
+    select_gateways(|ttl| {
+        let _ = socket.set_ttl(ttl as u32);
+        // Classic traceroute destination port range, one port per TTL.
+        let port = 33434 + ttl as u16;
+        let dest: socket2::SockAddr =
+            SocketAddr::V4(SocketAddrV4::new(TRACE_TARGET, port)).into();
+        if socket.send_to(&[0u8; 8], &dest).is_err() {
+            return None;
+        }
+        poll_errqueue_offender(fd, per_hop_ms)
+    })
+}
+
 /// Unprivileged DGRAM-ICMP walk (Linux only). A ping socket can't receive the
 /// intermediate Time-Exceeded messages via `recv()`, but enabling `IP_RECVERR`
 /// routes those ICMP errors to the socket's *error queue*; `recvmsg(MSG_ERRQUEUE)`
@@ -326,19 +446,7 @@ fn walk_dgram_linux(per_hop: Duration) -> Option<DetectedGateways> {
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)).ok()?;
     let fd = socket.as_raw_fd();
-
-    // Deliver ICMP errors to the error queue so we can read intermediate hops.
-    let on: libc::c_int = 1;
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_RECVERR,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
+    if !enable_ip_recverr(fd) {
         return None;
     }
 
@@ -352,14 +460,7 @@ fn walk_dgram_linux(per_hop: Duration) -> Option<DetectedGateways> {
         if socket.send_to(&packet, &dest).is_err() {
             return None;
         }
-        // Block (up to the per-hop budget) for an error-queue event, then read the
-        // offender. `POLLERR` is reported in `revents` regardless of `events`.
-        let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
-        let pr = unsafe { libc::poll(&mut pfd, 1, per_hop_ms) };
-        if pr <= 0 {
-            return None; // no response within the budget
-        }
-        recv_errqueue_offender(fd)
+        poll_errqueue_offender(fd, per_hop_ms)
     })
 }
 

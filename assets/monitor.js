@@ -15,7 +15,8 @@ function monitorDetail() {
   let chart = null;
   let lineData = [];        // [[tsMs, y|null], ...]
   let downIntervals = [];   // [[startMs, endMs], ...]
-  let tlSegments = [];      // state timeline: [{ state, label, start, end, color }, ...]
+  let tlSegments = [];      // state timeline: [{ state, label, start, end, color, row }, ...]
+  let tlRows = ['IP'];      // timeline category rows (single for publicip; per hop for border)
   const tlColorMap = new Map(); // stable value → color across re-renders/zoom (publicip)
   let windowFrom = null, windowTo = null; // ms; the fixed axis extent (active window)
   // Anchor for all data-range math: the newest server-recorded probe time (ms).
@@ -86,6 +87,8 @@ function monitorDetail() {
     detailExtentFrom: null,  // ms; oldest retained data
     detailExtentTo: null,    // ms; newest retained data (live edge)
     borderEndpoint: '',      // "ip1 → ip2 → ip3"; populated from config on load, real IPs via SSE
+    borderPath: null,        // { local, isp, upstream } resolved IPs from /border/segments
+    hopUptime: { local: null, isp: null, upstream: null }, // per-hop uptime % over the loaded window
 
     async init() {
       const id = this.monitorId;
@@ -188,7 +191,9 @@ function monitorDetail() {
         this._scheduleTraceLive();
         return;
       }
-      if (this.timelineKind) {
+      if (this.timelineKind === 'border') {
+        if (borderHopSig(u.detail) !== lastTimelineValue) this._scheduleLiveRefresh();
+      } else if (this.timelineKind) {
         const incoming = extractState({ detail: u.detail ?? '' });
         if (incoming !== lastTimelineValue) this._scheduleLiveRefresh();
       } else {
@@ -274,14 +279,27 @@ function monitorDetail() {
       const seq = ++refetchSeq;
       this.isLoadingDetail = true;
       try {
-        // Public-IP and border monitors render a state timeline via the server-
-        // collapsed segments endpoint (no row-count cap, spans the full window).
+        // Border monitors render one up/down row per path hop (local GW, border
+        // GW, upstream) from the per-hop segments endpoint, which also carries
+        // the currently resolved path IPs for the Network Path panel.
+        if (this.timelineKind === 'border') {
+          const url = `/api/monitors/${id}/border/segments?from=${encodeURIComponent(fromIso)}`
+            + `&to=${encodeURIComponent(toIso)}`;
+          const data = await (await fetch(url)).json().catch(() => null);
+          if (seq !== refetchSeq) return;
+          this._applyBorderData(data, resetView);
+          return;
+        }
+
+        // Public-IP monitors render a state timeline via the server-collapsed
+        // segments endpoint (no row-count cap, spans the full window).
         if (this.timelineKind) {
           const segUrl = `/api/monitors/${id}/segments?from=${encodeURIComponent(fromIso)}`
             + `&to=${encodeURIComponent(toIso)}`;
           const serverSegs = await (await fetch(segUrl)).json().catch(() => []);
           if (seq !== refetchSeq) return;
           this.sampleCount = serverSegs.length;
+          tlRows = ['IP'];
           tlSegments = serverSegs.map(s => ({
             state: s.state,
             start: s.start_ms,
@@ -402,45 +420,88 @@ function monitorDetail() {
       this.ipDistinct = seen.size;
     },
 
-    // Decompose borderEndpoint into per-hop display objects for the network path panel.
-    // Endpoint formats (→-separated):
-    //   2 hops: local_gw → upstream             (no public hop detected)
-    //   3 hops: local_gw → isp_gw → upstream    (full path)
-    // local_gw is the last private hop (LAN edge → "Local GW"); isp_gw is the first
-    // public hop (ISP gateway → "Border GW").
+    // Build the per-hop timeline rows + per-hop uptime from a /border/segments
+    // response: one up/down row per path position, gray where unmeasured.
+    _applyBorderData(data, resetView) {
+      if (data && data.path) this.borderPath = data.path;
+      const hops = [
+        { key: 'local',    label: 'Local GW',  segs: (data && data.local)    || [] },
+        { key: 'isp',      label: 'Border GW', segs: (data && data.isp)      || [] },
+        { key: 'upstream', label: 'Upstream',  segs: (data && data.upstream) || [] },
+      ];
+      tlRows = hops.map(h => h.label);
+      tlSegments = [];
+      const uptime = {};
+      hops.forEach((h, row) => {
+        let upMs = 0, knownMs = 0;
+        for (const s of h.segs) {
+          const dur = Math.max(0, s.end_ms - s.start_ms);
+          if (s.state === 'up') upMs += dur;
+          if (s.state === 'up' || s.state === 'down') knownMs += dur;
+          tlSegments.push({
+            state: s.state, start: s.start_ms, end: s.end_ms, row,
+            color: BORDER_HOP_COLORS[s.state] || UNKNOWN_COLOR,
+            label: BORDER_HOP_LABELS[s.state] || 'no data',
+            rowLabel: h.label,
+          });
+        }
+        uptime[h.key] = knownMs > 0 ? (upMs / knownMs) * 100 : null;
+      });
+      this.hopUptime = uptime;
+      this.sampleCount = tlSegments.length;
+      // Live-update suppression key: the latest per-hop reachability signature,
+      // comparable to borderHopSig() of an incoming probe's detail.
+      lastTimelineValue = hops
+        .map(h => ((h.segs.length ? h.segs[h.segs.length - 1].state : null) === 'up'))
+        .join('|');
+      this.tlLegend = BORDER_HOP_LEGEND;
+      this.lossCount = 0;
+      this.hasData = tlSegments.length > 0;
+      this.renderTimeline(resetView);
+    },
+
+    // The three path hop cards for the Network Path panel. IPs come from the
+    // resolved path (/border/segments), falling back to the config endpoint
+    // string ("gw → isp → upstream", "auto" while undetected) until it arrives;
+    // status/RTT come from the latest probe's detail; uptime is window-scoped
+    // from the per-hop segments.
     borderHops() {
-      const hops = this.borderEndpoint
-        ? this.borderEndpoint.split(' → ').map(s => s.trim())
-        : [];
-      if (!hops.length) return [];
-      const rtts = parseBorderRtts(this.detail);
-      const fr = this.failureReason; // null | 'lan_down' | 'isp_gw_down' | 'isp_down'
-      const localSt = fr === 'lan_down' ? 'down' : 'up';
-      const upSt = fr == null ? 'up' : (fr === 'isp_down' ? 'down' : 'unknown');
-      if (hops.length >= 3) {
-        // local_gw → isp_gw → upstream
-        const ispSt = fr === 'lan_down' ? 'unknown' : (fr === 'isp_gw_down' ? 'down' : 'up');
-        return [
-          { label: 'Local GW',  ip: hops[0], rtt: rtts.local,    status: localSt },
-          { label: 'Border GW', ip: hops[1], rtt: rtts.isp,      status: ispSt   },
-          { label: 'Upstream',  ip: hops[2], rtt: rtts.upstream, status: upSt    },
-        ];
+      let { local, isp, upstream } = this.borderPath || {};
+      if (local == null && upstream == null) {
+        const toks = this.borderEndpoint
+          ? this.borderEndpoint.split(' → ').map(s => s.trim())
+          : [];
+        if (!toks.length) return [];
+        local = toks[0];
+        upstream = toks[toks.length - 1];
+        if (toks.length >= 3) isp = toks[1];
       }
-      // 2 hops: local_gw → upstream (no public hop detected)
+      const st = parseBorderHopStates(this.detail);
+      const rtts = parseBorderRtts(this.detail);
+      const card = (label, key, ip) => ({
+        label,
+        ip: ip && ip !== 'auto' ? ip : null,
+        rtt: rtts[key],
+        status: st[key] || 'unknown',
+        uptime: this.hopUptime[key],
+      });
       return [
-        { label: 'Local GW',  ip: hops[0],               rtt: rtts.local,    status: localSt },
-        { label: 'Upstream',  ip: hops[hops.length - 1],  rtt: rtts.upstream, status: upSt    },
+        card('Local GW', 'local', local),
+        card('Border GW', 'isp', isp),
+        card('Upstream', 'upstream', upstream),
       ];
     },
 
-    // A state timeline: each segment fills the span a value was in effect (an IP
-    // for public-IP monitors; a fault class for border), colored per state. Built
-    // as a single-row custom series over the same time axis/zoom.
+    // A state timeline: each segment fills the span a value was in effect,
+    // colored per state. One row for public-IP (the address timeline); one row
+    // per path hop for border (each IP's up/down history). Built as a custom
+    // series over the same time axis/zoom.
     _timelineChartOption() {
+      const multiRow = tlRows.length > 1;
       return {
         backgroundColor: 'transparent',
         textStyle: { color: '#94a3b8', fontFamily: 'Inter, system-ui, sans-serif' },
-        grid: { left: 16, right: 16, top: 16, bottom: 64 },
+        grid: { left: multiRow ? 88 : 16, right: 16, top: 16, bottom: 64 },
         tooltip: {
           trigger: 'item',
           backgroundColor: '#1e293b',
@@ -451,7 +512,8 @@ function monitorDetail() {
             if (!d) return '';
             const start = new Date(d.value[0]).toLocaleString();
             const dur = fmtDuration(d.value[1] - d.value[0]);
-            return `<b>${d.label}</b><br/>since ${start}<br/>for ${dur}`;
+            const head = d.rowLabel ? `${d.rowLabel} — ${d.label}` : d.label;
+            return `<b>${head}</b><br/>since ${start}<br/>for ${dur}`;
           },
         },
         xAxis: {
@@ -464,11 +526,12 @@ function monitorDetail() {
         },
         yAxis: {
           type: 'category',
-          data: ['IP'],
-          show: false,
+          data: tlRows,
+          inverse: multiRow, // path order top→bottom: Local GW → Border GW → Upstream
+          show: multiRow,
           axisLine: { show: false },
           axisTick: { show: false },
-          axisLabel: { show: false },
+          axisLabel: { show: multiRow, color: '#94a3b8', fontSize: 11 },
         },
         dataZoom: [
           { type: 'inside', xAxisIndex: 0, filterMode: 'none', minValueSpan: 10_000 },
@@ -481,10 +544,11 @@ function monitorDetail() {
           type: 'custom',
           clip: true,
           renderItem: (params, api) => {
-            const start = api.coord([api.value(0), 0]);
-            const end = api.coord([api.value(1), 0]);
+            const row = api.value(2);
+            const start = api.coord([api.value(0), row]);
+            const end = api.coord([api.value(1), row]);
             const bandH = api.size([0, 1])[1];
-            const h = Math.max(10, Math.min(bandH * 0.55, 120));
+            const h = Math.max(10, Math.min(bandH * (tlRows.length > 1 ? 0.7 : 0.55), 120));
             const x = start[0];
             const w = Math.max(1, end[0] - start[0]);
             const y = start[1] - h / 2;
@@ -516,10 +580,11 @@ function monitorDetail() {
             }
             return { type: 'group', children };
           },
-          encode: { x: [0, 1], y: 0 },
+          encode: { x: [0, 1], y: 2 },
           data: tlSegments.map(s => ({
-            value: [s.start, s.end, 0],
+            value: [s.start, s.end, s.row || 0],
             label: s.label,
+            rowLabel: s.rowLabel,
             itemStyle: { color: s.color },
           })),
         }],
@@ -1004,13 +1069,19 @@ const IP_PALETTE = [
   '#60a5fa', '#fb923c', '#4ade80', '#e879f9', '#2dd4bf',
 ];
 const UNKNOWN_COLOR = '#475569'; // gray for down / no recorded state
-// Border fault classes get semantic colors and human labels (not a palette).
-const BORDER_COLORS = { ok: '#34d399', isp_gw_down: '#fb923c', isp_down: '#fbbf24', lan_down: '#f87171' };
-const BORDER_LABELS = { ok: 'OK', isp_gw_down: 'Border GW down', isp_down: 'ISP down', lan_down: 'LAN down' };
+// Border per-hop reachability: green up, red down, gray unmeasured.
+const BORDER_HOP_COLORS = { up: '#34d399', down: '#f87171' };
+const BORDER_HOP_LABELS = { up: 'Reachable', down: 'Unreachable' };
+// Static color key for the border chart (per-hop uptime lives in the path
+// panel, so no per-state durations here — ms: null hides the duration).
+const BORDER_HOP_LEGEND = [
+  { label: 'Reachable',   color: BORDER_HOP_COLORS.up,   ms: null },
+  { label: 'Unreachable', color: BORDER_HOP_COLORS.down, ms: null },
+  { label: 'No data',     color: UNKNOWN_COLOR,          ms: null },
+];
 
 // The state a probe recorded: the leading token of its detail (the IP for
-// public-IP; the fault class for border, which may carry a "—"/RTT suffix).
-// Null for down/no-detail samples.
+// public-IP monitors). Null for down/no-detail samples.
 function extractState(row) {
   if (row.detail) {
     const tok = row.detail.trim().split(/\s+/)[0];
@@ -1021,16 +1092,13 @@ function extractState(row) {
 
 function colorForState(kind, state, colorMap) {
   if (state == null) return UNKNOWN_COLOR;
-  if (kind === 'border') return BORDER_COLORS[state] || UNKNOWN_COLOR;
   // public-IP: stable palette per distinct address.
   if (!colorMap.has(state)) colorMap.set(state, IP_PALETTE[colorMap.size % IP_PALETTE.length]);
   return colorMap.get(state);
 }
 
 function stateLabel(kind, state) {
-  if (state == null) return kind === 'border' ? 'unknown' : 'no IP';
-  if (kind === 'border') return BORDER_LABELS[state] || state;
-  return state; // public-IP: the address as-is
+  return state == null ? 'no IP' : state; // public-IP: the address as-is
 }
 
 // Collapse consecutive same-state samples (ascending) into [start, end) segments.
@@ -1075,6 +1143,28 @@ function parseBorderRtts(detail) {
     return m ? parseInt(m[1], 10) : null;
   };
   return { local: num('local'), isp: num('isp'), upstream: num('upstream') };
+}
+
+// Per-hop reachability from a border detail's trailing RTT group (mirrors the
+// server's parsing): 'up' (an RTT), 'down' ('—'), or null (not measured).
+function parseBorderHopStates(detail) {
+  const out = { local: null, isp: null, upstream: null };
+  const m = detail && detail.match(/\(([^()]*)\)\s*$/);
+  if (!m) return out;
+  for (const part of m[1].split(',')) {
+    const toks = part.trim().split(/\s+/);
+    if (toks.length < 2 || !(toks[0] in out)) continue;
+    out[toks[0]] = toks[1] === '—' ? 'down' : 'up';
+  }
+  return out;
+}
+
+// Per-hop reachability signature of a live border probe ("true|false|true"),
+// comparable to the last loaded segments' tail states — used to skip chart
+// reloads when no hop changed state.
+function borderHopSig(detail) {
+  const st = parseBorderHopStates(detail);
+  return [st.local, st.isp, st.upstream].map(s => s === 'up').join('|');
 }
 
 function fmtDuration(ms) {
