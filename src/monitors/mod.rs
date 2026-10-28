@@ -94,6 +94,10 @@ pub const DEFAULT_BORDER_UPSTREAM: &str = "1.1.1.1";
 /// Minimum scheduling interval for a traceroute monitor: a run is expensive and
 /// high-volume, so the interval is clamped to this floor rather than rejected.
 pub const TRACEROUTE_MIN_INTERVAL_MS: u64 = 500;
+/// Minimum scheduling interval for any monitor. The API rejects lower values and
+/// the scheduler floors to it, so a zero interval (which would panic the ticker)
+/// or a tight loop can't come in through an old config row either.
+pub const MIN_INTERVAL_MS: u64 = 500;
 
 impl MonitorConfig {
     pub fn name(&self) -> &str {
@@ -115,6 +119,17 @@ impl MonitorConfig {
             Self::PublicIp(c) => c.interval_ms,
             Self::Border(c) => c.interval_ms,
             Self::Traceroute(c) => c.interval_ms,
+        }
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        match self {
+            Self::Http(c) => c.timeout_ms,
+            Self::Tcp(c) => c.timeout_ms,
+            Self::Icmp(c) => c.timeout_ms,
+            Self::PublicIp(c) => c.timeout_ms,
+            Self::Border(c) => c.timeout_ms,
+            Self::Traceroute(c) => c.timeout_ms,
         }
     }
 

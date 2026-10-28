@@ -299,16 +299,17 @@ function dashboard() {
     },
 
     // Split a probe's detail for display. A border detail's trailing RTT group
-    // "(gw X, upstream Y)" is broken onto its own lines so it stays inside the
-    // card; other details render as a single line.
+    // "(local X, isp Y, upstream Z)" is broken onto one line per hop so it stays
+    // inside the card; other details render as a single line.
     formatDetail(detail) {
       if (!detail) return [];
-      const m = detail.match(/^(.*?)\s*\(gw\s*(.*?),\s*upstream\s*(.*?)\)\s*$/);
+      const m = detail.match(/^(.*?)\s*\(((?:local|isp|upstream)\s[^()]*)\)\s*$/);
       if (!m) return [detail];
       const lines = [];
       if (m[1].trim()) lines.push(m[1].trim());
-      lines.push(`gw ${m[2].trim()}`);
-      lines.push(`upstream ${m[3].trim()}`);
+      for (const part of m[2].split(',')) {
+        if (part.trim()) lines.push(part.trim());
+      }
       return lines;
     },
   };

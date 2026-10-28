@@ -392,17 +392,44 @@ fn enable_ip_recverr(fd: libc::c_int) -> bool {
     rc == 0
 }
 
-/// Wait (up to the per-hop budget) for an error-queue event, then read the
-/// offending router's address. `POLLERR` is reported in `revents` regardless
-/// of `events`.
+/// Wait (up to the per-hop budget) for this hop's error-queue event, then read
+/// the offending router's address. `POLLERR` is reported in `revents`
+/// regardless of `events`. Errors that don't satisfy `is_ours` (a late reply to
+/// an earlier TTL that timed out) are discarded and the wait continues, so a
+/// straggler is never attributed to the wrong hop.
 #[cfg(target_os = "linux")]
-fn poll_errqueue_offender(fd: libc::c_int, per_hop_ms: libc::c_int) -> Option<Ipv4Addr> {
-    let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
-    let pr = unsafe { libc::poll(&mut pfd, 1, per_hop_ms) };
-    if pr <= 0 {
-        return None; // no response within the budget
+fn poll_errqueue_offender<F>(fd: libc::c_int, per_hop: Duration, is_ours: F) -> Option<Ipv4Addr>
+where
+    F: Fn(&ErrQueueEntry) -> bool,
+{
+    let deadline = Instant::now() + per_hop;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr <= 0 {
+            return None; // no response within the budget
+        }
+        let entry = recv_errqueue(fd)?;
+        if is_ours(&entry) {
+            return entry.offender;
+        }
     }
-    recv_errqueue_offender(fd)
+}
+
+/// Drop anything already queued (stragglers from earlier hops) before a send.
+#[cfg(target_os = "linux")]
+fn drain_errqueue(fd: libc::c_int) {
+    loop {
+        let mut pfd = libc::pollfd { fd, events: 0, revents: 0 };
+        if unsafe { libc::poll(&mut pfd, 1, 0) } <= 0 || recv_errqueue(fd).is_none() {
+            return;
+        }
+    }
 }
 
 /// Unprivileged UDP walk (Linux only) — the `tracepath` technique: send UDP
@@ -420,18 +447,18 @@ fn walk_udp_linux(per_hop: Duration) -> Option<DetectedGateways> {
         return None;
     }
 
-    let per_hop_ms = per_hop.as_millis().min(i32::MAX as u128) as libc::c_int;
-
     select_gateways(|ttl| {
         let _ = socket.set_ttl(ttl as u32);
-        // Classic traceroute destination port range, one port per TTL.
+        // Classic traceroute destination port range, one port per TTL; the
+        // error's original destination port identifies which TTL it answers.
         let port = 33434 + ttl as u16;
         let dest: socket2::SockAddr =
             SocketAddr::V4(SocketAddrV4::new(TRACE_TARGET, port)).into();
+        drain_errqueue(fd);
         if socket.send_to(&[0u8; 8], &dest).is_err() {
             return None;
         }
-        poll_errqueue_offender(fd, per_hop_ms)
+        poll_errqueue_offender(fd, per_hop, |e| e.dest_port == Some(port))
     })
 }
 
@@ -452,23 +479,39 @@ fn walk_dgram_linux(per_hop: Duration) -> Option<DetectedGateways> {
 
     let dest: socket2::SockAddr = SocketAddr::V4(SocketAddrV4::new(TRACE_TARGET, 0)).into();
     let ident = trace_ident();
-    let per_hop_ms = per_hop.as_millis().min(i32::MAX as u128) as libc::c_int;
 
     select_gateways(|ttl| {
         let _ = socket.set_ttl(ttl as u32);
-        let packet = build_echo(ident, ttl as u16);
+        let seq = ttl as u16;
+        let packet = build_echo(ident, seq);
+        drain_errqueue(fd);
         if socket.send_to(&packet, &dest).is_err() {
             return None;
         }
-        poll_errqueue_offender(fd, per_hop_ms)
+        // The queued payload is the original echo header; its sequence number
+        // identifies the TTL (the id is rewritten by the kernel/NAT, seq isn't).
+        poll_errqueue_offender(fd, per_hop, |e| e.echo_seq.is_none_or(|s| s == seq))
     })
 }
 
-/// Read one ICMP error off the socket error queue and return the offending
-/// router's IPv4 address (the `SO_EE_OFFENDER` sockaddr that trails the
-/// `sock_extended_err` in the `IP_RECVERR` control message).
+/// One entry read off a socket's error queue.
 #[cfg(target_os = "linux")]
-fn recv_errqueue_offender(fd: libc::c_int) -> Option<Ipv4Addr> {
+struct ErrQueueEntry {
+    /// The router that sent the ICMP error (`SO_EE_OFFENDER`), if IPv4.
+    offender: Option<Ipv4Addr>,
+    /// Destination port of the datagram that triggered the error (UDP walk).
+    dest_port: Option<u16>,
+    /// Sequence number of the original echo, when the queued payload is an
+    /// ICMP echo header (DGRAM-ICMP walk).
+    echo_seq: Option<u16>,
+}
+
+/// Read one ICMP error off the socket error queue: the offending router's IPv4
+/// address (the `SO_EE_OFFENDER` sockaddr that trails the `sock_extended_err`
+/// in the `IP_RECVERR` control message) plus what identifies the original
+/// datagram. `None` when the queue is empty.
+#[cfg(target_os = "linux")]
+fn recv_errqueue(fd: libc::c_int) -> Option<ErrQueueEntry> {
     // SAFETY: all pointers below reference stack buffers that outlive the
     // `recvmsg` call, and the cmsg fields are only read after the kernel reports
     // it populated them.
@@ -488,27 +531,39 @@ fn recv_errqueue_offender(fd: libc::c_int) -> Option<Ipv4Addr> {
         msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
         msg.msg_controllen = ctrl.len() as _;
 
-        if libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE) < 0 {
+        let n = libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT);
+        if n < 0 {
             return None;
         }
+        let n = n as usize;
 
+        // msg_name is the original datagram's destination.
+        let dest_port = (from.ss_family == libc::AF_INET as libc::sa_family_t).then(|| {
+            let sin = &from as *const _ as *const libc::sockaddr_in;
+            u16::from_be((*sin).sin_port)
+        });
+        let echo_seq = (n >= 8 && data[0] == ICMP_ECHO_REQUEST)
+            .then(|| u16::from_be_bytes([data[6], data[7]]));
+
+        let mut offender = None;
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             let c = &*cmsg;
             if c.cmsg_level == libc::IPPROTO_IP && c.cmsg_type == libc::IP_RECVERR {
                 let ee = libc::CMSG_DATA(cmsg) as *const libc::sock_extended_err;
                 // SO_EE_OFFENDER(ee): sockaddr immediately following the struct.
-                let offender = (ee as *const u8)
+                let off = (ee as *const u8)
                     .add(std::mem::size_of::<libc::sock_extended_err>())
                     as *const libc::sockaddr;
-                if (*offender).sa_family == libc::AF_INET as libc::sa_family_t {
-                    let sin = offender as *const libc::sockaddr_in;
-                    return Some(Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr)));
+                if (*off).sa_family == libc::AF_INET as libc::sa_family_t {
+                    let sin = off as *const libc::sockaddr_in;
+                    offender = Some(Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr)));
+                    break;
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
-        None
+        Some(ErrQueueEntry { offender, dest_port, echo_seq })
     }
 }
 

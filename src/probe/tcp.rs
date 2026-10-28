@@ -10,7 +10,9 @@ pub async fn run(cfg: &TcpMonitorConfig) -> ProbeResult {
     let timeout = Duration::from_millis(cfg.timeout_ms);
     let start = Instant::now();
 
-    match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
+    // Connect via (host, port) rather than the "host:port" string so IPv6
+    // literals (e.g. "::1") parse; `addr` is only the display endpoint.
+    match tokio::time::timeout(timeout, TcpStream::connect((cfg.host.as_str(), cfg.port))).await {
         Ok(Ok(_stream)) => {
             let elapsed = start.elapsed().as_millis() as u64;
             debug!(monitor = %cfg.name, addr = %addr, elapsed_ms = elapsed, "TCP probe success");

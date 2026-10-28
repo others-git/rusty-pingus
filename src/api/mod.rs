@@ -16,7 +16,7 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::db;
-use crate::monitors::{MonitorConfig, MonitorStore, StoredMonitor};
+use crate::monitors::{MonitorConfig, MonitorStore, StoredMonitor, MIN_INTERVAL_MS};
 use crate::probe::ProbeResult;
 
 #[derive(Clone)]
@@ -605,6 +605,13 @@ fn validate_monitor(monitor: &MonitorConfig, existing: &[StoredMonitor]) -> Vec<
         errors.push("name must be 100 characters or fewer".into());
     } else if existing.iter().any(|m| m.config.name() == name) {
         errors.push(format!("a monitor named '{}' already exists", name));
+    }
+
+    if monitor.interval_ms() < MIN_INTERVAL_MS {
+        errors.push(format!("interval_ms must be at least {MIN_INTERVAL_MS}"));
+    }
+    if monitor.timeout_ms() == 0 {
+        errors.push("timeout_ms must be at least 1".into());
     }
 
     match monitor {

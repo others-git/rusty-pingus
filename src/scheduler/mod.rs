@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::StatusUpdate;
-use crate::monitors::{MonitorConfig, MonitorStore, StoredMonitor};
+use crate::monitors::{MonitorConfig, MonitorStore, StoredMonitor, MIN_INTERVAL_MS};
 use crate::db;
 use crate::probe;
 
@@ -115,7 +115,9 @@ fn spawn_monitor(
         let id = monitor.id;
         let config = monitor.config;
         let name = config.name().to_string();
-        let interval_ms = config.interval_ms();
+        // Floor the interval: a zero period panics tokio's ticker, and API
+        // validation doesn't cover rows written before it existed.
+        let interval_ms = config.interval_ms().max(MIN_INTERVAL_MS);
 
         // Stagger the first tick: tickers otherwise start together, so monitors
         // sharing an interval probe (and write) in lockstep forever. The offset
@@ -262,7 +264,10 @@ pub async fn rollup_loop(pool: SqlitePool, cancel: CancellationToken) {
             _ = ticker.tick() => {
                 let now_min = current_minute();
                 // Roll complete minutes [next_from, now_min) in day-sized chunks.
-                let mut from = next_from;
+                // Start one minute back: a probe stamped just before a minute
+                // boundary can be inserted after that minute was rolled, so the
+                // last rolled minute is re-rolled (INSERT OR REPLACE) to pick it up.
+                let mut from = (next_from - 60).max(0);
                 while from < now_min {
                     let to = (from + 86_400).min(now_min);
                     match db::roll_up_range(&pool, from, to).await {
